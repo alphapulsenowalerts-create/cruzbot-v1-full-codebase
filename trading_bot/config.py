@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
+import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Mapping
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -357,3 +359,89 @@ def get_settings() -> Settings:
 def reload_settings() -> Settings:
     get_settings.cache_clear()
     return get_settings()
+
+
+ENV_KEY_TRADE_CAP = "MAX_NOTIONAL_PER_TRADE_USD"
+ENV_KEY_MAX_BOOK = "MAX_TOTAL_EXPOSURE_USD"
+
+_ENV_LINE_RE = re.compile(
+    r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$"
+)
+
+
+def format_env_float(value: float) -> str:
+    """Compact decimal for .env (no scientific notation; strip trailing zeros)."""
+    s = f"{float(value):.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def apply_runtime_trade_caps(settings: Settings, trade_cap: float, max_book: float) -> None:
+    """Mutate the live Settings instance shared with risk_manager / executor.
+
+    Does not change paper/live mode. Callers persist env keys separately.
+    """
+    object.__setattr__(settings, "max_notional_per_trade_usd", float(trade_cap))
+    object.__setattr__(settings, "max_total_exposure_usd", float(max_book))
+
+
+def upsert_env_keys(path: Path | str, updates: Mapping[str, str]) -> Path:
+    """Create or update KEY=value lines in a .env file without wiping other keys.
+
+    Comment lines are left untouched. Existing matching keys are replaced in
+    place (including ``export KEY=``). Missing keys are appended. Write is
+    atomic (temp file + replace) so a crash cannot truncate the file.
+    """
+    env_path = Path(path)
+    pending = {str(k): str(v) for k, v in updates.items()}
+    if not pending:
+        return env_path
+
+    if env_path.exists():
+        raw = env_path.read_text(encoding="utf-8")
+        existing_lines = raw.splitlines()
+    else:
+        existing_lines = []
+
+    found: set[str] = set()
+    out: list[str] = []
+    for line in existing_lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if match is None:
+            out.append(line)
+            continue
+        key = match.group(2)
+        if key in pending:
+            out.append(f"{match.group(1)}{key}{match.group(3)}{pending[key]}")
+            found.add(key)
+        else:
+            out.append(line)
+
+    for key, value in pending.items():
+        if key not in found:
+            out.append(f"{key}={value}")
+
+    text = "\n".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=env_path.name + ".",
+        suffix=".tmp",
+        dir=str(env_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, env_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return env_path

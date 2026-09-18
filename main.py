@@ -66,9 +66,11 @@ from trading_bot.telegram_commands import (
     OpsControlState,
     REPLY_CONFIRM_EXPIRED,
     REPLY_MODE_LIVE_PENDING,
+    SetLimitError,
     TelegramCommandListener,
     current_pid,
     day_trades_from_ledger,
+    execute_set_limit,
     format_mode_reply,
     format_status_reply,
 )
@@ -507,6 +509,38 @@ class TradingApp:
             + f"\n{ALERT_LIVE_ACTIVATED}"
         )
 
+    async def _cmd_set_limit(self, _cmd: str, args: list[str]) -> str:
+        """ /set_limit <trade_cap> <max_book> — live-update size caps (not paper/live mode). """
+        try:
+            reply = execute_set_limit(
+                self.settings,
+                args,
+                env_path=PROJECT_ROOT / ".env",
+            )
+        except SetLimitError as exc:
+            return str(exc)
+        except Exception as exc:
+            logger.warning("set_limit persist/apply failed: %s", exc)
+            return f"/set_limit failed; caps unchanged: {exc}"
+        logger.warning(
+            "OPS /set_limit — trade_cap=$%.2f max_book=$%.2f (runtime + .env); paper/live unchanged",
+            float(self.settings.max_notional_per_trade_usd),
+            float(self.settings.max_total_exposure_usd),
+        )
+        try:
+            self.trade_logger.log_event(
+                "set_limit",
+                {
+                    "trade_cap": float(self.settings.max_notional_per_trade_usd),
+                    "max_book": float(self.settings.max_total_exposure_usd),
+                    "env_keys": ["MAX_NOTIONAL_PER_TRADE_USD", "MAX_TOTAL_EXPOSURE_USD"],
+                    "paper_trading_mode": bool(self.settings.paper_trading_mode),
+                },
+            )
+        except Exception as exc:
+            logger.debug("set_limit log: %s", exc)
+        return reply
+
     def _wire_telegram_commands(self) -> None:
         if not bool(getattr(self.settings, "telegram_commands_enabled", True)):
             logger.info("TELEGRAM_COMMANDS_ENABLED=false — command listener off")
@@ -528,6 +562,7 @@ class TradingApp:
                 "kill": self._cmd_kill,
                 "mode": self._cmd_mode,
                 "confirm_live": self._cmd_confirm_live,
+                "set_limit": self._cmd_set_limit,
             },
         )
 
