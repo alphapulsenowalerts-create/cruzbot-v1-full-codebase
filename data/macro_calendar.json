@@ -1,0 +1,51 @@
+{
+  "updated": "2026-09-18T04:15:52.588969+00:00",
+  "note": "High-impact US macro only; bot pauses \u00b1MACRO_PAUSE_MINUTES around these.",
+  "events": [
+    {
+      "title": "FOMC Rate Decision",
+      "time": "2026-09-17T18:00:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "Nonfarm Payrolls NFP",
+      "time": "2026-10-02T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "CPI",
+      "time": "2026-10-14T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "FOMC Rate Decision",
+      "time": "2026-11-05T18:00:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "Nonfarm Payrolls NFP",
+      "time": "2026-11-06T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "CPI",
+      "time": "2026-11-12T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "Nonfarm Payrolls NFP",
+      "time": "2026-12-04T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "CPI",
+      "time": "2026-12-10T12:30:00+00:00",
+      "importance": "high"
+    },
+    {
+      "title": "FOMC Rate Decision",
+      "time": "2026-12-16T18:00:00+00:00",
+      "importance": "high"
+    }
+  ]
+}

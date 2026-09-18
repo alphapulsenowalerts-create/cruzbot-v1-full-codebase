@@ -1,0 +1,9 @@
+{
+  "rvol_breakout_mult": 2.0,
+  "rsi_buy_cap": 72.0,
+  "min_tp_pct": 0.025,
+  "regime": "no_data",
+  "score": -1000000000.0,
+  "timestamp": "2026-09-18T19:53:15.452955+00:00",
+  "lookback_days": 1
+}
