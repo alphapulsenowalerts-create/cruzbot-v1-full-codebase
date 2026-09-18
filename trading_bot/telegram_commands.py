@@ -1,7 +1,7 @@
 """Interactive Telegram command long-poll (authorized chat only).
 
 User-initiated replies only — never unsolicited status spam.
-Commands: /status /pause /resume /pnl /kill /mode /confirm_live
+Commands: /status /pause /resume /pnl /kill /mode /confirm_live /set_limit
 """
 
 from __future__ import annotations
@@ -10,7 +10,8 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, MutableMapping, Optional, Sequence
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
@@ -20,8 +21,14 @@ _CT = ZoneInfo("America/Chicago")
 CommandHandler = Callable[[str, List[str]], Awaitable[str]]
 
 KNOWN_COMMANDS = frozenset(
-    {"status", "pause", "resume", "pnl", "kill", "mode", "confirm_live"}
+    {"status", "pause", "resume", "pnl", "kill", "mode", "confirm_live", "set_limit"}
 )
+
+SET_LIMIT_USAGE = "Usage: /set_limit <trade_cap> <max_book> (e.g. /set_limit 100 400)"
+
+
+class SetLimitError(ValueError):
+    """Invalid /set_limit arguments — callers must not change state."""
 
 LIVE_CONFIRM_TTL_SECONDS = 90.0
 
@@ -99,6 +106,80 @@ def format_mode_reply(*, paper: bool, cash: float, equity: float) -> str:
     """Brief /mode reply: MODE: PAPER|LIVE plus cash/equity one-liner."""
     mode = "PAPER" if paper else "LIVE"
     return f"MODE: {mode} | cash=${float(cash):.2f} equity=${float(equity):.2f}"
+
+
+def parse_set_limit_args(args: Sequence[str]) -> tuple[float, float]:
+    """Parse `/set_limit <trade_cap> <max_book>` → (trade_cap, max_book).
+
+    Both values must be positive numbers and ``max_book >= trade_cap``.
+    Raises SetLimitError with a user-facing message on failure.
+    """
+    if len(args) != 2:
+        raise SetLimitError(SET_LIMIT_USAGE)
+    try:
+        trade_cap = float(args[0])
+        max_book = float(args[1])
+    except (TypeError, ValueError) as exc:
+        raise SetLimitError(
+            f"Both values must be numbers. {SET_LIMIT_USAGE}"
+        ) from exc
+    if trade_cap != trade_cap or max_book != max_book:  # NaN
+        raise SetLimitError(f"Both values must be numbers. {SET_LIMIT_USAGE}")
+    if trade_cap <= 0 or max_book <= 0:
+        raise SetLimitError(
+            f"Both trade_cap and max_book must be positive. {SET_LIMIT_USAGE}"
+        )
+    if max_book < trade_cap:
+        raise SetLimitError(
+            f"max_book (${max_book:.2f}) must be >= trade_cap (${trade_cap:.2f}). "
+            f"{SET_LIMIT_USAGE}"
+        )
+    return trade_cap, max_book
+
+
+def format_set_limit_reply(trade_cap: float, max_book: float) -> str:
+    """Telegram confirmation after a successful /set_limit."""
+    return (
+        f"Trade cap updated to ${float(trade_cap):.2f} | "
+        f"Max book updated to ${float(max_book):.2f}"
+    )
+
+
+def execute_set_limit(
+    settings: Any,
+    args: Sequence[str],
+    *,
+    env_path: Path,
+    environ: Optional[MutableMapping[str, str]] = None,
+) -> str:
+    """Validate, persist to .env, then mutate the live Settings object.
+
+    Size caps only — paper/live mode is never changed. Persist happens before
+    the in-memory update so a disk failure leaves runtime state unchanged.
+    """
+    from trading_bot.config import (
+        ENV_KEY_MAX_BOOK,
+        ENV_KEY_TRADE_CAP,
+        apply_runtime_trade_caps,
+        format_env_float,
+        upsert_env_keys,
+    )
+
+    trade_cap, max_book = parse_set_limit_args(args)
+    trade_s = format_env_float(trade_cap)
+    book_s = format_env_float(max_book)
+    upsert_env_keys(
+        env_path,
+        {
+            ENV_KEY_TRADE_CAP: trade_s,
+            ENV_KEY_MAX_BOOK: book_s,
+        },
+    )
+    env_map = os.environ if environ is None else environ
+    env_map[ENV_KEY_TRADE_CAP] = trade_s
+    env_map[ENV_KEY_MAX_BOOK] = book_s
+    apply_runtime_trade_caps(settings, trade_cap, max_book)
+    return format_set_limit_reply(trade_cap, max_book)
 
 
 def day_trades_from_ledger(
@@ -323,7 +404,7 @@ class TelegramCommandListener:
             return
         self._running = True
         logger.info(
-            "Telegram commands armed (chat_id=%s) — /status /pause /resume /pnl /kill /mode /confirm_live",
+            "Telegram commands armed (chat_id=%s) — /status /pause /resume /pnl /kill /mode /confirm_live /set_limit",
             self.chat_id,
         )
         # Drop pending updates so we don't reply to stale commands after restart

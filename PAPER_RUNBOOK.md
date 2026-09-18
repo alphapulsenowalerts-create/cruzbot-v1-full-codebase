@@ -49,8 +49,9 @@ Set `TELEGRAM_COMMANDS_ENABLED=true` with bot token + chat id. Long-poll replies
 - `/mode live` — does **not** switch yet; replies to type `/confirm_live` (pending ~90s TTL)
 - `/confirm_live` — only if pending valid: runtime `paper_trading_mode=False` + high-priority alert
 - `/mode paper` — immediate runtime PAPER restore + high-priority alert; cancels pending live confirm
+- `/set_limit <trade_cap> <max_book>` — live-update per-trade and book caps (e.g. `/set_limit 100 400`). Mutates the running Settings object risk_manager already holds, then upserts `.env` keys `MAX_NOTIONAL_PER_TRADE_USD` / `MAX_TOTAL_EXPOSURE_USD` so the values survive restart. Does **not** change paper/live mode.
 
-**Runtime only:** mode flips mutate the in-memory Settings flag used by broker/executor. `.env` is not rewritten. Restart always returns to `.env` `PAPER_TRADING_MODE` (safe default). LIVE still respects allowlist, $50/$200 caps, and post-only. Paper book is preserved across runtime flips.
+**Runtime only:** mode flips mutate the in-memory Settings flag used by broker/executor. `.env` is not rewritten. Restart always returns to `.env` `PAPER_TRADING_MODE` (safe default). LIVE still respects allowlist, per-trade/book caps, and post-only. Paper book is preserved across runtime flips. `/set_limit` is the exception that *does* persist size caps.
 
 Fill/exit alert templates unchanged. No unsolicited status spam (except high-priority mode-change alerts).
 

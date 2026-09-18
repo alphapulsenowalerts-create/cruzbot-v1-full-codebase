@@ -32,6 +32,8 @@ def test_parse_command_known():
     assert parse_command("/mode paper") == ("mode", ["paper"])
     assert parse_command("/confirm_live") == ("confirm_live", [])
     assert parse_command("/mode@CruzBot live") == ("mode", ["live"])
+    assert parse_command("/set_limit 100 400") == ("set_limit", ["100", "400"])
+    assert parse_command("/set_limit@CruzBot 100 400") == ("set_limit", ["100", "400"])
 
 
 def test_parse_command_ignores_unknown():
