@@ -16,7 +16,8 @@ agentic-day-trading-bot/
 │   ├── test_agent_decision.py
 │   ├── test_advanced_guardrails.py
 │   ├── test_smoke.py
-│   └── test_coinbase_broker.py
+│   ├── test_coinbase_broker.py
+│   └── test_kraken_broker.py
 └── trading_bot/
     ├── __init__.py
     ├── config.py           # pydantic-settings from env
@@ -33,6 +34,7 @@ agentic-day-trading-bot/
     │   ├── base.py         # BrokerAdapter ABC
     │   ├── alpaca.py       # REST + WS (US stocks paper/live)
     │   ├── coinbase.py     # Advanced Trade spot (SDK / JWT; paper-gated)
+    │   ├── kraken.py       # Kraken spot REST + optional WS (paper-gated; Instance #2)
     │   ├── ib_stub.py      # interface only
     │   └── mock.py         # dry-run
     └── utils/
@@ -46,7 +48,7 @@ agentic-day-trading-bot/
 main.py
   ├─ config.Settings
   ├─ logger.setup_logging, TradeLogger
-  ├─ brokers.{mock,alpaca,coinbase,ib_stub}  →  brokers.base, models, utils.retry
+  ├─ brokers.{mock,alpaca,coinbase,kraken,ib_stub}  →  brokers.base, models, utils.retry
   ├─ data_feed.DataFeed             →  brokers.base, models, utils.indicators, utils.retry
   ├─ agent_core.AgentCore           →  models (SetupPreFilter gate)
   ├─ risk_manager.RiskManager       →  config, models
@@ -69,10 +71,11 @@ utils.indicators ──► pandas / numpy (/ pandas-ta optional)
 
 ## Broker selection
 
-`BROKER=alpaca|coinbase|mock|ib` (CLI `--dry-run` forces `mock`).
+`BROKER=alpaca|coinbase|kraken|mock|ib` (CLI `--dry-run` forces `mock`).
 
 - **Alpaca** — best for US equity **paper** (`paper-api.alpaca.markets`).
 - **Coinbase Advanced Trade** — crypto spot for Al’s path; when `PAPER_TRADING_MODE=true`, `submit_order` / cancel / liquidate never hit live create endpoints (simulated fills).
+- **Kraken** — Instance #2 isolated paper (`KRAKEN_API_*`); same paper gate; maker-only via `oflags=post`. Symbol helpers map `BTC-USD` → `XBTUSD` / `XBT/USD` / `XXBTZUSD`.
 - **Robinhood** — not integrated.
 
 ## Runtime flow

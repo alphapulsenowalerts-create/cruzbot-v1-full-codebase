@@ -38,6 +38,7 @@ Keep paper mode on until the loop, sizing, and kill-switch are verified end-to-e
 | Broker | Best for | Notes |
 |--------|----------|--------|
 | **Coinbase Advanced Trade** | **Al’s default: crypto VWAP scalps** | Default `BROKER=coinbase`. Use CDP API keys (`COINBASE_API_KEY` / `COINBASE_API_SECRET`). Keep `PAPER_TRADING_MODE=true` until verified. Spot only in this adapter. |
+| **Kraken** | **Instance #2 isolated paper** | `BROKER=kraken` with `KRAKEN_API_KEY` / `KRAKEN_API_SECRET`. Same strategy stack; maker-only via `oflags=post`. See [INSTANCE_2_KRAKEN.md](INSTANCE_2_KRAKEN.md). |
 | **Alpaca** | **US stock paper testing** | Best stock paper environment (`paper-api.alpaca.markets`). Set `BROKER=alpaca` when practicing equities. |
 | **Robinhood** | **Not suitable** | No proper retail algorithmic/API trading surface for agentic bots. Equities under $25k also face PDT restrictions. Prefer Coinbase (crypto) or Alpaca (stock paper). |
 | **Mock** | Offline dry-run / CI | `--dry-run` — no credentials, synthetic bars/fills. |
@@ -84,7 +85,7 @@ cp .env.example .env
 |----------|---------|--------|
 | `PAPER_TRADING_MODE` | `true` | Hard preference for paper; **required** to block live Coinbase submits |
 | `ACCOUNT_EQUITY` | `1000` | Starting equity assumption / mock / Coinbase paper book |
-| `BROKER` | `coinbase` | `alpaca` \| `coinbase` \| `mock` \| `ib` |
+| `BROKER` | `coinbase` | `alpaca` \| `coinbase` \| `kraken` \| `mock` \| `ib` |
 | `SYMBOLS` | `BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,SUI-USD,ADA-USD` | Coinbase product IDs |
 | `MAX_RISK_PER_TRADE_PCT` | `0.015` | Clamped to 1–2% |
 | `DAILY_DRAWDOWN_LIMIT_PCT` | `0.03` | Circuit breaker |
@@ -93,6 +94,7 @@ cp .env.example .env
 | `BAR_TIMEFRAME` / `AGENT_POLL_SECONDS` | `1Min` / `3` | Scalp loop cadence |
 | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | empty | Paper keys only in `.env` |
 | `COINBASE_API_KEY` / `COINBASE_API_SECRET` | empty | CDP key name + private key PEM |
+| `KRAKEN_API_KEY` / `KRAKEN_API_SECRET` | empty | Instance #2 Kraken spot keys (base64 secret) |
 | `LIQUIDATE_ON_KILL` | `false` | Flatten on signal |
 | `USE_LLM` / `PREFILTER_*` | `false` / `0.002` + `2.0` | Hybrid gate; LLM only when setup fires |
 | `MACRO_PAUSE_ENABLED` / `MACRO_PAUSE_MINUTES` | `true` / `15` | Pause around major news |
@@ -144,6 +146,26 @@ python main.py
 ```
 
 With paper mode on, intended orders are logged and filled in a local simulated book — **no real Advanced Trade submits**.
+
+## Run Instance #2 (Kraken paper, isolated checkout)
+
+Use a second working directory (e.g. `cruzbot_instance_2`) so SQLite / paper book / optimizer files never collide with Instance #1:
+
+```bash
+cp .env.instance2.example .env
+# set KRAKEN_API_KEY / KRAKEN_API_SECRET and TELEGRAM_* ; keep PAPER_TRADING_MODE=true
+BROKER=kraken
+SQLITE_PATH=data/trading_bot_2.db
+ACTIVE_PARAMS_PATH=data/active_params_2.json
+PAPER_BOOK_PATH=data/paper_book_2.json
+```
+
+```bash
+python main.py --once
+python main.py
+```
+
+systemd unit: `deploy/cruzbot2.service`. Full start/stop and paper-only rules: [INSTANCE_2_KRAKEN.md](INSTANCE_2_KRAKEN.md).
 
 ## Run Alpaca paper (US stocks)
 

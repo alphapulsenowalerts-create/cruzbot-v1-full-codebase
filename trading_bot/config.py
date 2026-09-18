@@ -99,7 +99,19 @@ class Settings(BaseSettings):
         alias="COINBASE_BASE_URL",
     )
 
-    # Broker selection: alpaca | coinbase | mock | ib
+    # Kraken spot (Instance #2). Secret is the base64 API-Sign key from Kraken.
+    kraken_api_key: str = Field(default="", alias="KRAKEN_API_KEY")
+    kraken_api_secret: str = Field(default="", alias="KRAKEN_API_SECRET")
+    kraken_base_url: str = Field(
+        default="https://api.kraken.com",
+        alias="KRAKEN_BASE_URL",
+    )
+    kraken_ws_url: str = Field(
+        default="wss://ws.kraken.com",
+        alias="KRAKEN_WS_URL",
+    )
+
+    # Broker selection: alpaca | coinbase | kraken | mock | ib
     broker: str = Field(default="coinbase", alias="BROKER")
 
     # Feed / agent loop — 1m bars, faster poll for scalps

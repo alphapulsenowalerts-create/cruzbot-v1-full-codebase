@@ -1,0 +1,33 @@
+# CruzBot Instance #2 — Kraken paper trading loop
+# Isolated second checkout / process. Do not point this unit at Instance #1 paths.
+#
+# Install (user):
+#   cp deploy/cruzbot2.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now cruzbot2
+# Install (system):
+#   sudo cp deploy/cruzbot2.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now cruzbot2
+#
+# Paths below are placeholders matching a sibling checkout named cruzbot_instance_2.
+# Replace User= / Group= / WorkingDirectory / EnvironmentFile / ExecStart for your box.
+
+[Unit]
+Description=CruzBot Instance #2 Kraken paper day-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=box
+Group=box
+WorkingDirectory=/workspace/cruzbot_instance_2
+EnvironmentFile=/workspace/cruzbot_instance_2/.env
+ExecStart=/workspace/cruzbot_instance_2/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+# Keep PAPER_TRADING_MODE=true in Instance #2 .env — do not arm live via this unit
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
