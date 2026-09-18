@@ -12,6 +12,13 @@
 A complete, locked Python asyncio day-trading bot. Unzip → venv → copy `.env.example` → paste Coinbase CDP keys → run paper. Do **not** reinvent architecture or unlock risk limits unless Al explicitly changes them.
 
 ---
+## Codebase separation (do not mix)
+
+- **This handoff / `main` = Instance #1 Coinbase only** (Chief of Staff / Al's primary CruzBot).
+- **Kraken Instance #2** from the other bot lives on GitHub PR #1 / branch `cursor/kraken-instance-2-8598` and must stay out of `main` unless Al explicitly approves a merge.
+- Never share SQLite, paper book, or `.env` between instances.
+
+
 
 ## Locked parameters (DO NOT loosen without Al)
 
