@@ -24,6 +24,7 @@ from trading_bot.brokers.alpaca import AlpacaBroker
 from trading_bot.brokers.base import BrokerAdapter
 from trading_bot.brokers.coinbase import CoinbaseBroker
 from trading_bot.brokers.ib_stub import IBBrokerStub
+from trading_bot.brokers.kraken import KrakenBroker
 from trading_bot.brokers.mock import MockBroker
 from trading_bot.config import PROJECT_ROOT, Settings, get_settings, reload_settings
 from trading_bot.data_feed import DataFeed
@@ -120,6 +121,8 @@ def build_broker(settings: Settings) -> BrokerAdapter:
         return IBBrokerStub()
     if name == "coinbase":
         return CoinbaseBroker(settings)
+    if name == "kraken":
+        return KrakenBroker(settings)
     return AlpacaBroker(settings)
 
 
