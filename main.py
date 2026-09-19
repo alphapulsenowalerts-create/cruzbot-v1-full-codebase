@@ -327,6 +327,47 @@ class TradingApp:
             age = self.feed.last_tick_age_seconds
         except Exception:
             age = getattr(self.broker, "last_tick_age_seconds", None)
+
+        entry_proximity = None
+        proximity_symbol = None
+        proximity_price = None
+        try:
+            eng = getattr(self.agent, "signal_engine", None)
+            if eng is not None and hasattr(eng, "get_entry_proximity"):
+                best_score = -1.0
+                best_prox = None
+                best_sym = None
+                best_px = None
+                # Prefer highest proximity; BTC-USD wins ties
+                items = list((self._last_obs or {}).items())
+                items.sort(
+                    key=lambda kv: (
+                        0 if str(kv[0]).upper() in ("BTC-USD", "BTC/USD") else 1,
+                        str(kv[0]),
+                    )
+                )
+                for sym, obs in items:
+                    try:
+                        prox = eng.get_entry_proximity(obs)
+                        sc = float((prox or {}).get("score") or 0.0)
+                        # Strict > keeps earlier (BTC-first) on ties
+                        if sc > best_score:
+                            best_score = sc
+                            best_prox = prox
+                            best_sym = sym
+                            try:
+                                best_px = float(obs.indicators.close or 0) or None
+                            except Exception:
+                                best_px = None
+                    except Exception:
+                        continue
+                if best_prox is not None:
+                    entry_proximity = best_prox
+                    proximity_symbol = best_sym
+                    proximity_price = best_px
+        except Exception as exc:
+            logger.debug("status entry proximity: %s", exc)
+
         return format_status_reply(
             paper_cash=cash,
             paper_equity=equity,
@@ -336,6 +377,9 @@ class TradingApp:
             last_tick_age_seconds=age,
             pid=current_pid(),
             paper=bool(self.settings.paper_trading_mode),
+            entry_proximity=entry_proximity,
+            proximity_symbol=proximity_symbol,
+            proximity_price=proximity_price,
         )
 
     async def _cmd_status(self, _cmd: str, _args: list[str]) -> str:

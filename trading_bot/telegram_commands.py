@@ -63,8 +63,13 @@ def format_status_reply(
     last_tick_age_seconds: Optional[float],
     pid: int,
     paper: bool = True,
+    entry_proximity: Optional[Dict[str, Any]] = None,
+    proximity_symbol: Optional[str] = None,
+    proximity_price: Optional[float] = None,
 ) -> str:
-    """Brief /status reply text."""
+    """Brief /status reply text (optional entry-proximity bar)."""
+    from trading_bot.utils.indicators import make_progress_bar
+
     nl = chr(10)
     mode = "PAPER" if paper else "LIVE"
     pause_s = "PAUSED (no new buys)" if paused else "running"
@@ -80,6 +85,21 @@ def format_status_reply(
         f"last_tick_age={tick_s}",
         f"pid={pid}",
     ]
+    if entry_proximity is not None:
+        direction = str(entry_proximity.get("direction") or "HOLD")
+        try:
+            score = float(entry_proximity.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        lines.append(f"Target Setup: {direction}")
+        lines.append(f"Entry Proximity: {make_progress_bar(score)}")
+        if proximity_symbol:
+            if proximity_price is not None and float(proximity_price) > 0:
+                lines.append(
+                    f"focus={proximity_symbol} @ ${float(proximity_price):,.2f}"
+                )
+            else:
+                lines.append(f"focus={proximity_symbol}")
     if not positions:
         lines.append("positions: (none)")
     else:
