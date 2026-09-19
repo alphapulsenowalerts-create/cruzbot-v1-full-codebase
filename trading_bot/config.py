@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Al locked production allowlist — hard-enforced (CLI/env cannot add others).
 HARD_SYMBOL_ALLOWLIST: frozenset[str] = frozenset(
     {
+        # Core (original)
         "BTC-USD",
         "ETH-USD",
         "SOL-USD",
@@ -23,6 +24,22 @@ HARD_SYMBOL_ALLOWLIST: frozenset[str] = frozenset(
         "AVAX-USD",
         "SUI-USD",
         "ADA-USD",
+        # Added 2026-09-19: liquid Coinbase majors NOT in Al's Coinbase bag
+        # (skipped DOT/ATOM/ALGO/POL — already held; bag long-tail stays untouchable)
+        "DOGE-USD",
+        "LTC-USD",
+        "BCH-USD",
+        "UNI-USD",
+        "AAVE-USD",
+        "NEAR-USD",
+        "XLM-USD",
+        "APT-USD",
+        "ARB-USD",
+        "OP-USD",
+        "FIL-USD",
+        "INJ-USD",
+        "HBAR-USD",
+        "SEI-USD",
     }
 )
 
@@ -40,16 +57,16 @@ class Settings(BaseSettings):
     paper_trading_mode: bool = Field(default=True, alias="PAPER_TRADING_MODE")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
 
-    # Account — Al locked $200 trading book (Coinbase crypto VWAP scalps)
-    account_equity: float = Field(default=200.0, alias="ACCOUNT_EQUITY")
+    # Account — Al locked $1,600 trading book (Coinbase crypto VWAP scalps)
+    account_equity: float = Field(default=1600.0, alias="ACCOUNT_EQUITY")
     symbols: str = Field(
-        default="BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,SUI-USD,ADA-USD",
+        default="BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,SUI-USD,ADA-USD,DOGE-USD,LTC-USD,BCH-USD,UNI-USD,AAVE-USD,NEAR-USD,XLM-USD,APT-USD,ARB-USD,OP-USD,FIL-USD,INJ-USD,HBAR-USD,SEI-USD",
         alias="SYMBOLS",
     )
     # Absolute live caps (not merely % of book)
-    max_notional_per_trade_usd: float = Field(default=50.0, alias="MAX_NOTIONAL_PER_TRADE_USD")
+    max_notional_per_trade_usd: float = Field(default=100.0, alias="MAX_NOTIONAL_PER_TRADE_USD")
     min_notional_usd: float = Field(default=10.0, alias="MIN_NOTIONAL_USD")
-    max_total_exposure_usd: float = Field(default=200.0, alias="MAX_TOTAL_EXPOSURE_USD")
+    max_total_exposure_usd: float = Field(default=1000.0, alias="MAX_TOTAL_EXPOSURE_USD")
     qty_precision: int = Field(default=8, alias="QTY_PRECISION")
     quiet_notifier: bool = Field(default=True, alias="QUIET_NOTIFIER")
     # Max hold before hard time-stop exit (minutes). Sweet-spot default 30.
@@ -172,7 +189,7 @@ class Settings(BaseSettings):
     htf_cache_seconds: float = Field(default=300.0, alias="HTF_CACHE_SECONDS")
     # 4) Dynamic ATR position sizing
     # Formula: notional = base_notional * (price * ATR_REF_PCT / ATR)
-    # clipped to [MIN_NOTIONAL_USD, MAX_NOTIONAL_PER_TRADE_USD] — hard caps unchanged
+    # clipped to [MIN_NOTIONAL_USD, MAX_NOTIONAL_PER_TRADE_USD] — hard caps $100/trade $1000 exposure
     atr_sizing_enabled: bool = Field(default=True, alias="ATR_SIZING_ENABLED")
     atr_sizing_period: int = Field(default=14, alias="ATR_SIZING_PERIOD")
     atr_ref_pct: float = Field(default=0.01, alias="ATR_REF_PCT")
@@ -341,6 +358,64 @@ class Settings(BaseSettings):
         if self.dry_run:
             return "mock"
         return (self.broker or "coinbase").lower()
+
+
+# --- /set_limit persistence (hot-apply without process restart) ---
+SET_LIMIT_ENV_TRADE_CAP = "MAX_NOTIONAL_PER_TRADE_USD"
+SET_LIMIT_ENV_MAX_BOOK = "MAX_TOTAL_EXPOSURE_USD"
+# Optional alias keys updated when already present in .env
+_SET_LIMIT_TRADE_ALIASES = ("MAX_TRADE_CAP",)
+_SET_LIMIT_BOOK_ALIASES = ("MAX_BOOK_ALLOCATION",)
+
+
+def upsert_env_vars(updates: dict, path=None) -> None:
+    """Upsert KEY=value lines in .env and os.environ. Creates file if missing.
+
+    Alias keys are updated only when already present (never created).
+    """
+    import os
+    import re as _re
+
+    env_path = Path(path) if path is not None else PROJECT_ROOT / ".env"
+    def _env_val(v):
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+    mapping = {str(k): _env_val(v) for k, v in updates.items()}
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    if SET_LIMIT_ENV_TRADE_CAP in mapping:
+        for alias in _SET_LIMIT_TRADE_ALIASES:
+            if _re.search(rf"^{_re.escape(alias)}=", existing, flags=_re.M):
+                mapping[alias] = mapping[SET_LIMIT_ENV_TRADE_CAP]
+    if SET_LIMIT_ENV_MAX_BOOK in mapping:
+        for alias in _SET_LIMIT_BOOK_ALIASES:
+            if _re.search(rf"^{_re.escape(alias)}=", existing, flags=_re.M):
+                mapping[alias] = mapping[SET_LIMIT_ENV_MAX_BOOK]
+
+    raw_lines = existing.splitlines() if existing else []
+    keys_done = set()
+    out: list[str] = []
+    for line in raw_lines:
+        m = _re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", line)
+        if m and m.group(1) in mapping:
+            k = m.group(1)
+            out.append(f"{k}={mapping[k]}")
+            keys_done.add(k)
+        else:
+            out.append(line)
+    for k, v in mapping.items():
+        if k not in keys_done:
+            out.append(f"{k}={v}")
+    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    for k, v in mapping.items():
+        os.environ[k] = str(v)
+
+
+def apply_set_limit_to_settings(settings: "Settings", trade_cap: float, max_book: float) -> "Settings":
+    """Mutate settings in-place for trade cap / max book; return same object."""
+    object.__setattr__(settings, "max_notional_per_trade_usd", float(trade_cap))
+    object.__setattr__(settings, "max_total_exposure_usd", float(max_book))
+    return settings
 
 
 @lru_cache
