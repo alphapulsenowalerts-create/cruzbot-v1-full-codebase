@@ -96,7 +96,7 @@ def format_status_reply(
         if proximity_symbol:
             if proximity_price is not None and float(proximity_price) > 0:
                 lines.append(
-                    f"focus={proximity_symbol} @ ${float(proximity_price):.4g}"
+                    f"focus={proximity_symbol} @ ${float(proximity_price):,.2f}"
                 )
             else:
                 lines.append(f"focus={proximity_symbol}")
