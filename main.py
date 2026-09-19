@@ -25,7 +25,16 @@ from trading_bot.brokers.base import BrokerAdapter
 from trading_bot.brokers.coinbase import CoinbaseBroker
 from trading_bot.brokers.ib_stub import IBBrokerStub
 from trading_bot.brokers.mock import MockBroker
-from trading_bot.config import PROJECT_ROOT, Settings, get_settings, reload_settings
+from trading_bot.config import (
+    PROJECT_ROOT,
+    SET_LIMIT_ENV_MAX_BOOK,
+    SET_LIMIT_ENV_TRADE_CAP,
+    Settings,
+    apply_set_limit_to_settings,
+    get_settings,
+    reload_settings,
+    upsert_env_vars,
+)
 from trading_bot.data_feed import DataFeed
 from trading_bot.executor import Executor
 from trading_bot.logger import TradeLogger, setup_logging
@@ -141,6 +150,7 @@ class TradingApp:
             discord_webhook_url=settings.discord_webhook_url,
             telegram_bot_token=settings.telegram_bot_token,
             telegram_chat_id=settings.telegram_chat_id,
+            quiet=bool(settings.quiet_notifier),
         )
         self.macro = build_macro_guard(
             enabled=settings.macro_pause_enabled,
@@ -375,11 +385,14 @@ class TradingApp:
             paused=self.ops.paused,
             strategy_mode=str(self.settings.strategy_mode or ""),
             last_tick_age_seconds=age,
-            pid=current_pid(),
             paper=bool(self.settings.paper_trading_mode),
             entry_proximity=entry_proximity,
             proximity_symbol=proximity_symbol,
             proximity_price=proximity_price,
+            allowlist_symbols=list(self.settings.symbol_list),
+            starting_equity=float(self.settings.account_equity),
+            trade_cap=float(self.settings.max_notional_per_trade_usd),
+            max_exposure=float(self.settings.max_total_exposure_usd),
         )
 
     async def _cmd_status(self, _cmd: str, _args: list[str]) -> str:
@@ -565,6 +578,41 @@ class TradingApp:
             + f"\n{ALERT_LIVE_ACTIVATED}"
         )
 
+
+    async def _cmd_set_limit(self, _cmd: str, args: list[str]) -> str:
+        """Hot-apply trade_cap / max_book to settings + .env (no process restart)."""
+        from trading_bot.telegram_commands import (
+            parse_set_limit_args,
+            format_set_limit_reply,
+            REPLY_SET_LIMIT_USAGE,
+        )
+        from trading_bot.config import (
+            SET_LIMIT_ENV_TRADE_CAP,
+            SET_LIMIT_ENV_MAX_BOOK,
+            apply_set_limit_to_settings,
+            upsert_env_vars,
+            PROJECT_ROOT,
+        )
+
+        trade_cap, max_book, err = parse_set_limit_args(args)
+        if err is not None:
+            return err
+        apply_set_limit_to_settings(self.settings, float(trade_cap), float(max_book))
+        # Keep shared settings objects in sync when risk/executor hold same ref or copies
+        for obj in (getattr(self, "risk", None), getattr(self, "executor", None)):
+            if obj is not None and getattr(obj, "settings", None) is not None:
+                apply_set_limit_to_settings(obj.settings, float(trade_cap), float(max_book))
+        upsert_env_vars(
+            {SET_LIMIT_ENV_TRADE_CAP: float(trade_cap), SET_LIMIT_ENV_MAX_BOOK: float(max_book)},
+            path=PROJECT_ROOT / ".env",
+        )
+        logger.warning(
+            "OPS SET_LIMIT trade_cap=$%.2f max_book=$%.2f (persisted to .env)",
+            float(trade_cap),
+            float(max_book),
+        )
+        return format_set_limit_reply(float(trade_cap), float(max_book))
+
     def _wire_telegram_commands(self) -> None:
         if not bool(getattr(self.settings, "telegram_commands_enabled", True)):
             logger.info("TELEGRAM_COMMANDS_ENABLED=false — command listener off")
@@ -586,6 +634,7 @@ class TradingApp:
                 "kill": self._cmd_kill,
                 "mode": self._cmd_mode,
                 "confirm_live": self._cmd_confirm_live,
+                "set_limit": self._cmd_set_limit,
             },
         )
 
@@ -1267,7 +1316,7 @@ class TradingApp:
                 except Exception as exc:
                     logger.debug("post-fill live bankroll skipped: %s", exc)
             paper_cap = float(
-                getattr(self.settings, "max_total_exposure_usd", 200.0) or 200.0
+                getattr(self.settings, "max_total_exposure_usd", 1000.0) or 1000.0
             )
 
             if order.side == OrderSide.BUY:
@@ -2096,7 +2145,7 @@ async def async_main(argv: Optional[list[str]] = None) -> int:
     else:
         logger.critical(
             "PAPER_TRADING_MODE=false — LIVE trading enabled (explicit opt-in). "
-            "Allowlist + $50/$200 caps still enforced."
+            "Allowlist + $100/$1000 caps still enforced."
         )
 
     setup_logging(settings.log_level)
@@ -2176,6 +2225,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 discord_webhook_url=settings.discord_webhook_url,
                 telegram_bot_token=settings.telegram_bot_token,
                 telegram_chat_id=settings.telegram_chat_id,
+                quiet=bool(settings.quiet_notifier),
             )
 
             async def _ping() -> None:
