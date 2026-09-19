@@ -476,3 +476,83 @@ def atr_scaled_notional(
         return max(min_n, min(base, max_n))
     raw = base * (atr_ref / float(atr))
     return max(min_n, min(raw, max_n))
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: CVD divergence + liquidation-sweep entry gates (long / BUY only)
+# ---------------------------------------------------------------------------
+
+
+def check_cvd_divergence(
+    bar_open: Optional[float],
+    bar_close: Optional[float],
+    cvd_5m: Optional[float],
+    *,
+    enabled: bool = True,
+    ready: bool = True,
+    warmup_fail_closed: bool = True,
+) -> tuple[bool, str]:
+    """
+    Block long when the setup 5m bar is green (close > open) AND CVD 5m < 0.
+
+    Returns (allow_buy, detail). allow_buy False ⇒ SKIP / HOLD.
+    """
+    if not enabled:
+        return True, "cvd_divergence: disabled"
+    if not ready:
+        if warmup_fail_closed:
+            return False, "cvd_divergence: CVD not ready"
+        return True, "cvd_divergence: not ready (fail-open)"
+    if bar_open is None or bar_close is None or cvd_5m is None:
+        if warmup_fail_closed:
+            return False, "cvd_divergence: missing bar/CVD"
+        return True, "cvd_divergence: missing (fail-open)"
+    try:
+        o = float(bar_open)
+        c = float(bar_close)
+        cvd = float(cvd_5m)
+    except (TypeError, ValueError):
+        if warmup_fail_closed:
+            return False, "cvd_divergence: invalid bar/CVD"
+        return True, "cvd_divergence: invalid (fail-open)"
+    if c > o and cvd < 0:
+        return False, "cvd_divergence: green candle / negative CVD"
+    return True, f"cvd_divergence ok cvd_5m={cvd:.0f} bar={'green' if c > o else 'red/flat'}"
+
+
+def check_liq_sweep(
+    short_liq_1m_usd: Optional[float],
+    *,
+    min_short_usd: float = 50_000.0,
+    enabled: bool = True,
+    ready: bool = True,
+    warmup_fail_closed: bool = True,
+) -> tuple[bool, str]:
+    """
+    Require short-liquidation notional in the last 1m >= threshold before BUY.
+
+    Returns (allow_buy, detail).
+    """
+    if not enabled:
+        return True, "liq_sweep: disabled"
+    if not ready:
+        if warmup_fail_closed:
+            return False, "liq_sweep: liq not ready"
+        return True, "liq_sweep: not ready (fail-open)"
+    if short_liq_1m_usd is None:
+        if warmup_fail_closed:
+            return False, "liq_sweep: missing short liq"
+        return True, "liq_sweep: missing (fail-open)"
+    try:
+        short_usd = float(short_liq_1m_usd)
+    except (TypeError, ValueError):
+        if warmup_fail_closed:
+            return False, "liq_sweep: invalid short liq"
+        return True, "liq_sweep: invalid (fail-open)"
+    thresh = float(min_short_usd)
+    if short_usd + 1e-9 < thresh:
+        # Exact skip-reason string required by Phase 1 spec (default $50k)
+        if abs(thresh - 50_000.0) < 1e-6:
+            return False, "liq_sweep: short liq 1m < $50k"
+        return False, f"liq_sweep: short liq 1m < ${thresh:,.0f}"
+    return True, f"liq_sweep ok short_liq_1m=${short_usd:,.0f} >= ${thresh:,.0f}"

@@ -167,6 +167,16 @@ class TradingApp:
                 adx_min=float(settings.adx_min),
                 chop_max=float(settings.chop_max),
                 mtf_align_enabled=bool(settings.mtf_align_enabled),
+                cvd_divergence_enabled=bool(
+                    getattr(settings, "cvd_divergence_enabled", True)
+                ),
+                liq_sweep_required=bool(getattr(settings, "liq_sweep_required", True)),
+                liq_sweep_short_usd=float(
+                    getattr(settings, "liq_sweep_short_usd", 50_000.0) or 50_000.0
+                ),
+                cvd_warmup_fail_closed=bool(
+                    getattr(settings, "cvd_warmup_fail_closed", True)
+                ),
             )
             # Engine owns entry gates — skip legacy VWAP-spike prefilter
             require_prefilter = False
@@ -221,6 +231,13 @@ class TradingApp:
             signal_ttl_sec=float(getattr(settings, "perp_signal_ttl_sec", 30.0) or 30.0),
             on_signal=self._on_leadlag_signal,
         )
+        # Strategy reads CVD/liq snapshots only (non-blocking); WS updates stay in leadlag
+        try:
+            eng = getattr(self.agent, "signal_engine", None)
+            if eng is not None and hasattr(eng, "set_leadlag"):
+                eng.set_leadlag(self.leadlag)
+        except Exception as exc:
+            logger.debug("wire leadlag→sweet_spot: %s", exc)
         self.funding_oi = FundingOIFilter(
             enabled=bool(getattr(settings, "funding_oi_enabled", True)),
             symbols=settings.symbol_list,
@@ -1494,6 +1511,33 @@ class TradingApp:
                 indicators = indicators.model_copy(update={"extras": extras})
             except Exception as exc:
                 logger.debug("L2 attach skipped for %s: %s", symbol, exc)
+
+        # Phase 1: attach CVD / liq notional snapshots (non-blocking reads)
+        if indicators is not None and (
+            bool(getattr(self.settings, "cvd_divergence_enabled", False))
+            or bool(getattr(self.settings, "liq_sweep_required", False))
+        ):
+            try:
+                extras = dict(indicators.extras or {})
+                if hasattr(self.leadlag, "get_cvd_snapshot"):
+                    extras["cvd_snapshot"] = self.leadlag.get_cvd_snapshot(symbol)
+                if hasattr(self.leadlag, "get_liq_snapshot"):
+                    extras["liq_snapshot"] = self.leadlag.get_liq_snapshot(symbol)
+                # Prefer 5m entry bar open/close for CVD divergence when available
+                try:
+                    frame5 = getattr(self.feed, "get_entry_5m_frame", None)
+                    df5 = frame5(symbol) if callable(frame5) else None
+                    if df5 is None:
+                        df5 = getattr(self.feed, "_entry_5m", {}).get(symbol)
+                    if df5 is not None and hasattr(df5, "empty") and not df5.empty:
+                        row = df5.iloc[-1]
+                        extras["setup_bar_open"] = float(row["open"])
+                        extras["setup_bar_close"] = float(row["close"])
+                except Exception:
+                    pass
+                indicators = indicators.model_copy(update={"extras": extras})
+            except Exception as exc:
+                logger.debug("CVD/liq attach skipped for %s: %s", symbol, exc)
 
         position = await self.broker.get_position(symbol)
         memory = self.state.get_trade_memory(self.settings.trade_memory_size)

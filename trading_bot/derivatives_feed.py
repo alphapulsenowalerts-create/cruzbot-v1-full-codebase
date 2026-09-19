@@ -80,6 +80,44 @@ class FundingOISnapshot:
     fetched_at: float = 0.0
 
 
+@dataclass
+class CvdSnapshot:
+    """Rolling signed CVD notional deltas (buy aggressor +, sell aggressor -)."""
+    symbol: str
+    cvd_1m: float = 0.0
+    cvd_5m: float = 0.0
+    updated_at: float = 0.0
+    ready: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "cvd_1m": self.cvd_1m,
+            "cvd_5m": self.cvd_5m,
+            "updated_at": self.updated_at,
+            "ready": self.ready,
+        }
+
+
+@dataclass
+class LiqNotionalSnapshot:
+    """Rolling 1m liquidation notional split by short vs long liquidations."""
+    symbol: str
+    short_liq_1m_usd: float = 0.0
+    long_liq_1m_usd: float = 0.0
+    updated_at: float = 0.0
+    ready: bool = False
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "short_liq_1m_usd": self.short_liq_1m_usd,
+            "long_liq_1m_usd": self.long_liq_1m_usd,
+            "updated_at": self.updated_at,
+            "ready": self.ready,
+        }
+
+
 def detect_buy_sweep(
     buy_notional_window: float,
     avg_trade_notional: float,
@@ -193,6 +231,18 @@ class PerpLeadLagEngine:
         self._buy_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)  # ts, notional
         self._trade_sizes: Dict[str, Deque[float]] = defaultdict(deque)
         self._liq_events: Dict[str, Deque[float]] = defaultdict(deque)  # ts
+        # CVD: signed notional ticks (ts, signed_usd); buy aggressor +, sell aggressor -
+        self._cvd_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self._cvd_seen: Dict[str, bool] = defaultdict(bool)
+        self._cvd_updated_at: Dict[str, float] = {}
+        # Liq notional 1m: (ts, notional) per side (short = shorts liquidated / forced buy)
+        self._short_liq_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self._long_liq_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self._liq_notional_seen: Dict[str, bool] = defaultdict(bool)
+        self._liq_notional_updated_at: Dict[str, float] = {}
+        self.cvd_window_1m_sec: float = 60.0
+        self.cvd_window_5m_sec: float = 300.0
+        self.liq_notional_window_sec: float = 60.0
         self._sweep_until: Dict[str, float] = {}
         self._liq_until: Dict[str, float] = {}
         self._tasks: List[asyncio.Task] = []
@@ -218,6 +268,68 @@ class PerpLeadLagEngine:
                 updated_at=now,
             )
 
+    def get_cvd_snapshot(self, coinbase_symbol: str) -> Dict[str, Any]:
+        """Non-blocking snapshot of rolling 1m/5m CVD deltas for a Coinbase spot symbol."""
+        spot = (coinbase_symbol or "").strip().upper().replace("/", "-")
+        now = time.time()
+        with self._lock:
+            q = self._cvd_events.get(spot)
+            cvd_1m = 0.0
+            cvd_5m = 0.0
+            if q:
+                cut1 = now - self.cvd_window_1m_sec
+                cut5 = now - self.cvd_window_5m_sec
+                # Trim beyond 5m while summing
+                while q and q[0][0] < cut5:
+                    q.popleft()
+                for ts, signed in q:
+                    if ts >= cut5:
+                        cvd_5m += signed
+                    if ts >= cut1:
+                        cvd_1m += signed
+            ready = bool(self._cvd_seen.get(spot))
+            updated = float(self._cvd_updated_at.get(spot) or 0.0)
+            return CvdSnapshot(
+                symbol=spot,
+                cvd_1m=float(cvd_1m),
+                cvd_5m=float(cvd_5m),
+                updated_at=updated or now,
+                ready=ready,
+            ).as_dict()
+
+    def get_liq_snapshot(self, symbol: str) -> Dict[str, Any]:
+        """Non-blocking snapshot of rolling 1m short/long liquidation notional (USD)."""
+        spot = (symbol or "").strip().upper().replace("/", "-")
+        now = time.time()
+        with self._lock:
+            ncut = now - self.liq_notional_window_sec
+
+            def _sum_trim(q: Deque[Tuple[float, float]]) -> float:
+                while q and q[0][0] < ncut:
+                    q.popleft()
+                return float(sum(n for _, n in q))
+
+            short_q = self._short_liq_events.get(spot) or deque()
+            long_q = self._long_liq_events.get(spot) or deque()
+            # Ensure we mutate the stored deques when present
+            if spot in self._short_liq_events:
+                short_usd = _sum_trim(self._short_liq_events[spot])
+            else:
+                short_usd = 0.0
+            if spot in self._long_liq_events:
+                long_usd = _sum_trim(self._long_liq_events[spot])
+            else:
+                long_usd = 0.0
+            ready = bool(self._liq_notional_seen.get(spot))
+            updated = float(self._liq_notional_updated_at.get(spot) or 0.0)
+            return LiqNotionalSnapshot(
+                symbol=spot,
+                short_liq_1m_usd=float(short_usd),
+                long_liq_1m_usd=float(long_usd),
+                updated_at=updated or now,
+                ready=ready,
+            ).as_dict()
+
     def ingest_agg_trade(
         self,
         perp: str,
@@ -237,6 +349,17 @@ class PerpLeadLagEngine:
             while len(sizes) > self.avg_trade_window:
                 sizes.popleft()
             # Aggressive buy: buyer is taker ⇒ is_buyer_maker False
+            # CVD: aggressor side — buyer maker ⇒ sell aggressor (−); else buy aggressor (+)
+            if notional > 0:
+                signed = -notional if is_buyer_maker else notional
+                cvd_q = self._cvd_events[spot]
+                cvd_q.append((now, signed))
+                cvd_cut = now - self.cvd_window_5m_sec
+                while cvd_q and cvd_q[0][0] < cvd_cut:
+                    cvd_q.popleft()
+                self._cvd_seen[spot] = True
+                self._cvd_updated_at[spot] = now
+
             if not is_buyer_maker and notional > 0:
                 buys = self._buy_events[spot]
                 buys.append((now, notional))
@@ -258,15 +381,53 @@ class PerpLeadLagEngine:
                         )
                         self._emit()
 
-    def ingest_liquidation(self, perp: str, *, ts: Optional[float] = None) -> None:
+    def ingest_liquidation(
+        self,
+        perp: str,
+        *,
+        side: Optional[str] = None,
+        qty: float = 0.0,
+        price: float = 0.0,
+        notional: Optional[float] = None,
+        ts: Optional[float] = None,
+    ) -> None:
+        """
+        Ingest a force-order / liquidation.
+
+        ``side`` is the liquidation *order* side (Binance ``o.S`` / Bybit ``side``):
+          - BUY  ⇒ short was liquidated (forced buy) → counts toward short_liq
+          - SELL ⇒ long was liquidated (forced sell) → counts toward long_liq
+        """
         spot = perp_to_coinbase(perp) or perp
         now = ts if ts is not None else time.time()
+        if notional is None:
+            notional = abs(float(qty or 0.0) * float(price or 0.0))
+        else:
+            notional = abs(float(notional))
+        side_u = (side or "").strip().upper()
         with self._lock:
             ev = self._liq_events[spot]
             ev.append(now)
             cutoff = now - self.liq_window_sec
             while ev and ev[0] < cutoff:
                 ev.popleft()
+
+            # Side + notional rolling 1m windows (non-blocking in-memory update)
+            if notional > 0 and side_u in ("BUY", "SELL"):
+                ncut = now - self.liq_notional_window_sec
+                if side_u == "BUY":
+                    q = self._short_liq_events[spot]
+                    q.append((now, notional))
+                    while q and q[0][0] < ncut:
+                        q.popleft()
+                else:
+                    q = self._long_liq_events[spot]
+                    q.append((now, notional))
+                    while q and q[0][0] < ncut:
+                        q.popleft()
+                self._liq_notional_seen[spot] = True
+                self._liq_notional_updated_at[spot] = now
+
             if detect_liq_cascade(len(ev), min_cluster=self.liq_min_cluster):
                 was_hot = self._liq_until.get(spot, 0) > now
                 self._liq_until[spot] = now + self.signal_ttl_sec
@@ -293,6 +454,13 @@ class PerpLeadLagEngine:
             self._buy_events.clear()
             self._trade_sizes.clear()
             self._liq_events.clear()
+            self._cvd_events.clear()
+            self._cvd_seen.clear()
+            self._cvd_updated_at.clear()
+            self._short_liq_events.clear()
+            self._long_liq_events.clear()
+            self._liq_notional_seen.clear()
+            self._liq_notional_updated_at.clear()
             self._sweep_until.clear()
             self._liq_until.clear()
         logger.debug("PerpLeadLagEngine buffers cleared")
@@ -364,6 +532,9 @@ class PerpLeadLagEngine:
                                 o = data.get("o") or {}
                                 self.ingest_liquidation(
                                     str(o.get("s") or data.get("s") or ""),
+                                    side=str(o.get("S") or ""),
+                                    qty=float(o.get("q") or o.get("l") or 0),
+                                    price=float(o.get("ap") or o.get("p") or 0),
                                     ts=float(o.get("T") or 0) / 1000.0 if o.get("T") else None,
                                 )
                         except Exception as exc:
@@ -418,8 +589,22 @@ class PerpLeadLagEngine:
                             elif topic.startswith("allLiquidation.") and data is not None:
                                 perp = topic.split(".", 1)[-1]
                                 rows = data if isinstance(data, list) else [data]
-                                for _ in rows:
-                                    self.ingest_liquidation(perp)
+                                for row in rows:
+                                    if not isinstance(row, dict):
+                                        self.ingest_liquidation(perp)
+                                        continue
+                                    self.ingest_liquidation(
+                                        perp,
+                                        side=str(row.get("side") or row.get("S") or ""),
+                                        qty=float(row.get("size") or row.get("v") or 0),
+                                        price=float(row.get("price") or row.get("p") or 0),
+                                        ts=(
+                                            float(row.get("updatedTime") or row.get("T") or 0)
+                                            / 1000.0
+                                            if (row.get("updatedTime") or row.get("T"))
+                                            else None
+                                        ),
+                                    )
                         except Exception as exc:
                             logger.debug("bybit msg parse: %s", exc)
             except asyncio.CancelledError:
