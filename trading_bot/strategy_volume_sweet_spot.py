@@ -8,7 +8,9 @@ from typing import Any, Optional, Sequence
 from trading_bot.models import Action, AgentObservation, Bar, Decision
 from trading_bot.structural_guardrails import required_min_tp_pct
 from trading_bot.utils.indicators import (
+    check_cvd_divergence,
     check_l2_imbalance,
+    check_liq_sweep,
     check_mtf_align,
     check_regime_filter,
 )
@@ -205,6 +207,12 @@ class VolumeSweetSpotEngine:
         adx_min: float = 25.0,
         chop_max: float = 60.0,
         mtf_align_enabled: bool = False,
+        # Phase 1 CVD / liquidation-sweep gates (default False keeps legacy tests green)
+        cvd_divergence_enabled: bool = False,
+        liq_sweep_required: bool = False,
+        liq_sweep_short_usd: float = 50_000.0,
+        cvd_warmup_fail_closed: bool = True,
+        leadlag: Any = None,
     ) -> None:
         self.rvol_breakout_mult = rvol_breakout_mult
         self.pullback_vol_frac = pullback_vol_frac
@@ -223,6 +231,77 @@ class VolumeSweetSpotEngine:
         self.adx_min = adx_min
         self.chop_max = chop_max
         self.mtf_align_enabled = mtf_align_enabled
+        self.cvd_divergence_enabled = bool(cvd_divergence_enabled)
+        self.liq_sweep_required = bool(liq_sweep_required)
+        self.liq_sweep_short_usd = float(liq_sweep_short_usd)
+        self.cvd_warmup_fail_closed = bool(cvd_warmup_fail_closed)
+        self.leadlag = leadlag  # optional PerpLeadLagEngine; strategy reads snapshots only
+
+    def set_leadlag(self, leadlag: Any) -> None:
+        """Wire lead-lag/CVD/liq engine after construction (main constructs leadlag later)."""
+        self.leadlag = leadlag
+
+    def _resolve_cvd_liq(self, obs: AgentObservation) -> tuple[dict, dict]:
+        """Prefer extras snapshots (tests); else non-blocking leadlag snapshot reads."""
+        extras = obs.indicators.extras or {}
+        cvd: dict = {}
+        liq: dict = {}
+        raw_cvd = extras.get("cvd_snapshot")
+        if isinstance(raw_cvd, dict):
+            cvd = dict(raw_cvd)
+        else:
+            # Flat extras keys
+            if "cvd_5m" in extras or "cvd_1m" in extras:
+                cvd = {
+                    "cvd_1m": extras.get("cvd_1m"),
+                    "cvd_5m": extras.get("cvd_5m"),
+                    "ready": extras.get("cvd_ready", True),
+                    "updated_at": extras.get("cvd_updated_at"),
+                }
+        raw_liq = extras.get("liq_snapshot")
+        if isinstance(raw_liq, dict):
+            liq = dict(raw_liq)
+        else:
+            if "short_liq_1m_usd" in extras or "long_liq_1m_usd" in extras:
+                liq = {
+                    "short_liq_1m_usd": extras.get("short_liq_1m_usd"),
+                    "long_liq_1m_usd": extras.get("long_liq_1m_usd"),
+                    "ready": extras.get("liq_ready", True),
+                }
+        # Live engine snapshots (non-blocking)
+        if self.leadlag is not None:
+            try:
+                if not cvd and hasattr(self.leadlag, "get_cvd_snapshot"):
+                    cvd = dict(self.leadlag.get_cvd_snapshot(obs.symbol) or {})
+                if not liq and hasattr(self.leadlag, "get_liq_snapshot"):
+                    liq = dict(self.leadlag.get_liq_snapshot(obs.symbol) or {})
+            except Exception:
+                pass
+        return cvd, liq
+
+    def _setup_bar_open_close(self, obs: AgentObservation, bars: list) -> tuple[Optional[float], Optional[float]]:
+        """Prefer explicit 5m setup bar extras; else last recent bar open/close."""
+        extras = obs.indicators.extras or {}
+        if extras.get("setup_bar_open") is not None and extras.get("setup_bar_close") is not None:
+            try:
+                return float(extras["setup_bar_open"]), float(extras["setup_bar_close"])
+            except (TypeError, ValueError):
+                pass
+        if extras.get("bar_5m_open") is not None and extras.get("bar_5m_close") is not None:
+            try:
+                return float(extras["bar_5m_open"]), float(extras["bar_5m_close"])
+            except (TypeError, ValueError):
+                pass
+        if bars:
+            return _bar_field(bars[-1], "open"), _bar_field(bars[-1], "close")
+        # Fall back to indicator close vs extras open
+        ind = obs.indicators
+        if extras.get("open") is not None and ind.close is not None:
+            try:
+                return float(extras["open"]), float(ind.close)
+            except (TypeError, ValueError):
+                pass
+        return None, None
 
     def reason(self, obs: AgentObservation) -> Decision:
         ind = obs.indicators
@@ -370,6 +449,37 @@ class VolumeSweetSpotEngine:
                 logger.info("SKIP %s | %s", symbol, mtf_detail)
                 return Decision.hold(symbol, mtf_detail)
 
+        # --- Phase 1: CVD divergence BLOCK + liquidation-sweep REQUIRE (long only) ---
+        if self.cvd_divergence_enabled or self.liq_sweep_required:
+            cvd_snap, liq_snap = self._resolve_cvd_liq(obs)
+            if self.cvd_divergence_enabled:
+                bar_o, bar_c = self._setup_bar_open_close(obs, bars)
+                cvd_5m = cvd_snap.get("cvd_5m") if cvd_snap else None
+                cvd_ready = bool(cvd_snap.get("ready")) if cvd_snap else False
+                ok_cvd, cvd_detail = check_cvd_divergence(
+                    bar_o,
+                    bar_c,
+                    cvd_5m if cvd_5m is not None else None,
+                    enabled=True,
+                    ready=cvd_ready,
+                    warmup_fail_closed=self.cvd_warmup_fail_closed,
+                )
+                if not ok_cvd:
+                    logger.info("SKIP %s | %s", symbol, cvd_detail)
+                    return Decision.hold(symbol, cvd_detail)
+            if self.liq_sweep_required:
+                short_liq = liq_snap.get("short_liq_1m_usd") if liq_snap else None
+                liq_ready = bool(liq_snap.get("ready")) if liq_snap else False
+                ok_liq, liq_detail = check_liq_sweep(
+                    short_liq if short_liq is not None else None,
+                    min_short_usd=self.liq_sweep_short_usd,
+                    enabled=True,
+                    ready=liq_ready,
+                    warmup_fail_closed=self.cvd_warmup_fail_closed,
+                )
+                if not ok_liq:
+                    logger.info("SKIP %s | %s", symbol, liq_detail)
+                    return Decision.hold(symbol, liq_detail)
 
         swing_low = meta.get("swing_low") or extras.get("swing_low")
         if swing_low is None and obs.htf and obs.htf.swing_low is not None:

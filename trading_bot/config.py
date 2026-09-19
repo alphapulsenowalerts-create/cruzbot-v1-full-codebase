@@ -186,6 +186,12 @@ class Settings(BaseSettings):
     perp_liq_min_cluster: int = Field(default=5, alias="PERP_LIQ_MIN_CLUSTER")
     perp_signal_ttl_sec: float = Field(default=30.0, alias="PERP_SIGNAL_TTL_SEC")
 
+    # --- Phase 1: CVD divergence + liquidation sweep (long entry gates) ---
+    cvd_divergence_enabled: bool = Field(default=True, alias="CVD_DIVERGENCE_ENABLED")
+    liq_sweep_required: bool = Field(default=True, alias="LIQ_SWEEP_REQUIRED")
+    liq_sweep_short_usd: float = Field(default=50000.0, alias="LIQ_SWEEP_SHORT_USD")
+    cvd_warmup_fail_closed: bool = Field(default=True, alias="CVD_WARMUP_FAIL_CLOSED")
+
     funding_oi_enabled: bool = Field(default=True, alias="FUNDING_OI_ENABLED")
     funding_oi_poll_seconds: float = Field(default=60.0, alias="FUNDING_OI_POLL_SECONDS")
     funding_block_threshold: float = Field(default=0.0003, alias="FUNDING_BLOCK_THRESHOLD")
