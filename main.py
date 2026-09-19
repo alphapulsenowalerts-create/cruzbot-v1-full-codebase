@@ -26,7 +26,18 @@ from trading_bot.brokers.coinbase import CoinbaseBroker
 from trading_bot.brokers.ib_stub import IBBrokerStub
 from trading_bot.brokers.kraken import KrakenBroker
 from trading_bot.brokers.mock import MockBroker
-from trading_bot.config import PROJECT_ROOT, Settings, get_settings, reload_settings
+from trading_bot.config import (
+    PROJECT_ROOT,
+    SET_LIMIT_ENV_MAX_BOOK,
+    SET_LIMIT_ENV_TRADE_CAP,
+    Settings,
+    apply_set_limit_to_settings,
+    get_settings,
+    reload_settings,
+    upsert_env_vars,
+)
+# config_import_expanded
+from trading_bot.config import_PLACEHOLDER_
 from trading_bot.data_feed import DataFeed
 from trading_bot.executor import Executor
 from trading_bot.logger import TradeLogger, setup_logging
@@ -507,6 +518,41 @@ class TradingApp:
             + f"\n{ALERT_LIVE_ACTIVATED}"
         )
 
+    async def _cmd_set_limit(self, _cmd: str, args: list[str]) -> str:
+        """Hot-apply trade_cap / max_book to settings + .env (no process restart)."""
+        from trading_bot.telegram_commands import (
+            parse_set_limit_args,
+            format_set_limit_reply,
+            REPLY_SET_LIMIT_USAGE,
+        )
+        from trading_bot.config import (
+            SET_LIMIT_ENV_TRADE_CAP,
+            SET_LIMIT_ENV_MAX_BOOK,
+            apply_set_limit_to_settings,
+            upsert_env_vars,
+            PROJECT_ROOT,
+        )
+
+        trade_cap, max_book, err = parse_set_limit_args(args)
+        if err is not None:
+            return err
+        apply_set_limit_to_settings(self.settings, float(trade_cap), float(max_book))
+        # Keep shared settings objects in sync when risk/executor hold same ref or copies
+        for obj in (getattr(self, "risk", None), getattr(self, "executor", None)):
+            if obj is not None and getattr(obj, "settings", None) is not None:
+                apply_set_limit_to_settings(obj.settings, float(trade_cap), float(max_book))
+        upsert_env_vars(
+            {SET_LIMIT_ENV_TRADE_CAP: float(trade_cap), SET_LIMIT_ENV_MAX_BOOK: float(max_book)},
+            path=PROJECT_ROOT / ".env",
+        )
+        logger.warning(
+            "OPS SET_LIMIT trade_cap=$%.2f max_book=$%.2f (persisted to .env)",
+            float(trade_cap),
+            float(max_book),
+        )
+        return format_set_limit_reply(float(trade_cap), float(max_book))
+
+
     def _wire_telegram_commands(self) -> None:
         if not bool(getattr(self.settings, "telegram_commands_enabled", True)):
             logger.info("TELEGRAM_COMMANDS_ENABLED=false — command listener off")
@@ -528,6 +574,7 @@ class TradingApp:
                 "kill": self._cmd_kill,
                 "mode": self._cmd_mode,
                 "confirm_live": self._cmd_confirm_live,
+                "set_limit": self._cmd_set_limit,
             },
         )
 
