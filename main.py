@@ -43,7 +43,12 @@ from trading_bot.models import (
 from trading_bot.notifier import Notifier, build_notifier
 from trading_bot.risk_manager import RiskManager
 from trading_bot.state_store import BehavioralStateStore
-from trading_bot.derivatives_feed import FundingOIFilter, PerpLeadLagEngine
+from trading_bot.cvd import last_closed_5m_candle
+from trading_bot.derivatives_feed import (
+    FundingOIFilter,
+    PerpLeadLagEngine,
+    coinbase_to_perp,
+)
 from trading_bot.onchain_guards import OnchainGuards
 from trading_bot.order_reslicer import OrderReslicer
 from trading_bot.cointegration import CointegrationEngine, parse_pairs
@@ -167,6 +172,10 @@ class TradingApp:
                 adx_min=float(settings.adx_min),
                 chop_max=float(settings.chop_max),
                 mtf_align_enabled=bool(settings.mtf_align_enabled),
+                phase1_gate_enabled=bool(
+                    getattr(settings, "cvd_gate_enabled", True)
+                    or getattr(settings, "liq_sweep_gate_enabled", True)
+                ),
             )
             # Engine owns entry gates — skip legacy VWAP-spike prefilter
             require_prefilter = False
@@ -210,16 +219,23 @@ class TradingApp:
         self._priority_event = asyncio.Event()
         self._last_obs: Dict[str, AgentObservation] = {}
         self._active_params: dict = {}
+        mapped = [s for s in settings.symbol_list if coinbase_to_perp(s)]
         self.leadlag = PerpLeadLagEngine(
             enabled=bool(getattr(settings, "perp_leadlag_enabled", True)),
             venues=str(getattr(settings, "perp_leadlag_venues", "binance,bybit") or "binance,bybit"),
-            symbols=("BTC-USD", "ETH-USD"),
+            symbols=tuple(mapped) or ("BTC-USD", "ETH-USD"),
             sweep_mult=float(getattr(settings, "perp_sweep_mult", 3.0) or 3.0),
             sweep_window_sec=float(getattr(settings, "perp_sweep_window_sec", 5.0) or 5.0),
             liq_window_sec=float(getattr(settings, "perp_liq_window_sec", 10.0) or 10.0),
             liq_min_cluster=int(getattr(settings, "perp_liq_min_cluster", 5) or 5),
             signal_ttl_sec=float(getattr(settings, "perp_signal_ttl_sec", 30.0) or 30.0),
             on_signal=self._on_leadlag_signal,
+            cvd_period_sec=float(getattr(settings, "cvd_period_sec", 300.0) or 300.0),
+            short_liq_window_sec=float(getattr(settings, "liq_sweep_window_sec", 60.0) or 60.0),
+            short_liq_notional_threshold=float(
+                getattr(settings, "liq_sweep_notional_usd", 50_000.0) or 50_000.0
+            ),
+            short_liq_ttl_sec=float(getattr(settings, "liq_sweep_ttl_sec", 30.0) or 30.0),
         )
         self.funding_oi = FundingOIFilter(
             enabled=bool(getattr(settings, "funding_oi_enabled", True)),
@@ -549,6 +565,48 @@ class TradingApp:
                 pass
 
 
+    def _phase1_closed_5m(self, symbol: str) -> Optional[Tuple[float, float, int]]:
+        """Last closed 5m (open, close, period_start) from the entry-5m frame."""
+        period = float(getattr(self.settings, "cvd_period_sec", 300.0) or 300.0)
+        df = None
+        try:
+            getter = getattr(self.feed, "get_frame_5m", None)
+            if callable(getter):
+                df = getter(symbol)
+        except Exception:
+            df = None
+        return last_closed_5m_candle(df, period_sec=period)
+
+    def _phase1_allow_buy(self, symbol: str) -> Tuple[bool, str]:
+        """Final long-only Phase 1 gates (CVD absorption + short-liq sweep).
+
+        Called after every BUY source (sweet-spot, coint, sweep-fade) so a
+        blocked entry never reaches the executor. Snapshot reads only — no
+        await / network on this path.
+        """
+        cvd_on = bool(getattr(self.settings, "cvd_gate_enabled", True))
+        liq_on = bool(getattr(self.settings, "liq_sweep_gate_enabled", True))
+        if not cvd_on and not liq_on:
+            return True, ""
+        candle = self._phase1_closed_5m(symbol)
+        o = c = None
+        pstart = None
+        if candle is not None:
+            o, c, pstart = candle
+        return self.leadlag.evaluate_phase1_long(
+            symbol,
+            candle_open=o,
+            candle_close=c,
+            candle_period_start=pstart,
+            cvd_enabled=cvd_on,
+            liq_enabled=liq_on,
+            liq_threshold=float(
+                getattr(self.settings, "liq_sweep_notional_usd", 50_000.0) or 50_000.0
+            ),
+            fail_closed=bool(getattr(self.settings, "phase1_fail_closed", True)),
+            allow_cold_feed=bool(getattr(self.settings, "phase1_allow_cold_feed", False)),
+        )
+
     def _on_leadlag_signal(self, snap) -> None:
         """Elevate BTC/ETH (+ correlated allowlisted) for faster POST_ONLY BUY eval."""
         try:
@@ -709,6 +767,22 @@ class TradingApp:
             bool(self.settings.failure_blacklist_enabled),
             float(self.settings.failure_lookback_hours),
             float(self.settings.failure_block_minutes),
+        )
+
+        logger.info(
+            "PHASE1 INTEL ARMED | "
+            "CVD: enabled=%s period=%.0fs | "
+            "LiqSweep: enabled=%s thresh=$%.0f window=%.0fs ttl=%.0fs | "
+            "fail_closed=%s allow_cold_feed=%s "
+            "(cold tape: block unless PHASE1_ALLOW_COLD_FEED=true)",
+            bool(getattr(self.settings, "cvd_gate_enabled", True)),
+            float(getattr(self.settings, "cvd_period_sec", 300.0) or 300.0),
+            bool(getattr(self.settings, "liq_sweep_gate_enabled", True)),
+            float(getattr(self.settings, "liq_sweep_notional_usd", 50_000.0) or 50_000.0),
+            float(getattr(self.settings, "liq_sweep_window_sec", 60.0) or 60.0),
+            float(getattr(self.settings, "liq_sweep_ttl_sec", 30.0) or 30.0),
+            bool(getattr(self.settings, "phase1_fail_closed", True)),
+            bool(getattr(self.settings, "phase1_allow_cold_feed", False)),
         )
 
         logger.info(
@@ -1495,6 +1569,23 @@ class TradingApp:
             except Exception as exc:
                 logger.debug("L2 attach skipped for %s: %s", symbol, exc)
 
+        # Phase 1 CVD / short-liq snapshot → extras (O(1) reads; no await)
+        if indicators is not None:
+            try:
+                extras = dict(indicators.extras or {})
+                cvd_snap = self.leadlag.get_cvd_snapshot(symbol)
+                extras["cvd_cumulative"] = cvd_snap.cumulative
+                extras["cvd_period_delta"] = cvd_snap.period_delta
+                extras["cvd_trade_count"] = cvd_snap.trade_count
+                extras["short_liq_notional"] = self.leadlag.short_liq_notional(symbol)
+                extras["short_liq_spike"] = self.leadlag.has_short_liq_spike(symbol)
+                ok_p1, p1_reason = self._phase1_allow_buy(symbol)
+                extras["phase1_allow"] = ok_p1
+                extras["phase1_reason"] = p1_reason
+                indicators = indicators.model_copy(update={"extras": extras})
+            except Exception as exc:
+                logger.debug("phase1 extras attach skipped for %s: %s", symbol, exc)
+
         position = await self.broker.get_position(symbol)
         memory = self.state.get_trade_memory(self.settings.trade_memory_size)
 
@@ -1880,6 +1971,13 @@ class TradingApp:
         if self.risk.circuit_breaker_active and decision.action == Action.BUY:
             logger.warning("Circuit breaker — skip entry %s", symbol)
             return Decision.hold(symbol, "circuit breaker — skip entry")
+
+        # Phase 1: CVD divergence + short-liq sweep — last BUY gate before executor
+        if decision.action == Action.BUY:
+            ok_p1, p1_reason = self._phase1_allow_buy(symbol)
+            if not ok_p1:
+                logger.info("SKIP BUY %s | %s", symbol, p1_reason)
+                return Decision.hold(symbol, p1_reason)
 
         entry = (
             quote.ask

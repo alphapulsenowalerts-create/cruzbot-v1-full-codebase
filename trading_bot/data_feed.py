@@ -141,6 +141,10 @@ class DataFeed:
     def get_frame(self, symbol: str) -> Optional[pd.DataFrame]:
         return self._frames.get(symbol.upper())
 
+    def get_frame_5m(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Last refreshed 5m OHLCV frame (may include a still-forming last bar)."""
+        return self._frames_5m.get(symbol.upper())
+
     def get_indicators(self, symbol: str) -> IndicatorSnapshot:
         symbol = symbol.upper()
         df = self._frames.get(symbol)

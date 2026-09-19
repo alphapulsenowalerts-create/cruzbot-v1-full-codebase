@@ -186,6 +186,20 @@ class Settings(BaseSettings):
     perp_liq_min_cluster: int = Field(default=5, alias="PERP_LIQ_MIN_CLUSTER")
     perp_signal_ttl_sec: float = Field(default=30.0, alias="PERP_SIGNAL_TTL_SEC")
 
+    # --- Phase 1: CVD divergence + short-liquidation sweep (long-only BUY gates) ---
+    # Enable on Instance #2 by copying these keys; paper warmup: PHASE1_ALLOW_COLD_FEED=true
+    cvd_gate_enabled: bool = Field(default=True, alias="CVD_GATE_ENABLED")
+    cvd_period_sec: float = Field(default=300.0, alias="CVD_PERIOD_SEC")
+    liq_sweep_gate_enabled: bool = Field(default=True, alias="LIQ_SWEEP_GATE_ENABLED")
+    liq_sweep_window_sec: float = Field(default=60.0, alias="LIQ_SWEEP_WINDOW_SEC")
+    liq_sweep_notional_usd: float = Field(default=50_000.0, alias="LIQ_SWEEP_NOTIONAL_USD")
+    liq_sweep_ttl_sec: float = Field(default=30.0, alias="LIQ_SWEEP_TTL_SEC")
+    # fail-closed when tape/period data is missing (default). Confirmed absorption /
+    # missing short-liq spike always block once the feed is warm.
+    phase1_fail_closed: bool = Field(default=True, alias="PHASE1_FAIL_CLOSED")
+    # Paper warmup bypass: allow BUY while CVD/liq WS counters are still cold.
+    phase1_allow_cold_feed: bool = Field(default=False, alias="PHASE1_ALLOW_COLD_FEED")
+
     funding_oi_enabled: bool = Field(default=True, alias="FUNDING_OI_ENABLED")
     funding_oi_poll_seconds: float = Field(default=60.0, alias="FUNDING_OI_POLL_SECONDS")
     funding_block_threshold: float = Field(default=0.0003, alias="FUNDING_BLOCK_THRESHOLD")

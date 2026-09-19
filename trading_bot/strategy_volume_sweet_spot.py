@@ -205,6 +205,8 @@ class VolumeSweetSpotEngine:
         adx_min: float = 25.0,
         chop_max: float = 60.0,
         mtf_align_enabled: bool = False,
+        # Phase 1 extras (precomputed by main from lead-lag CVD / short-liq)
+        phase1_gate_enabled: bool = False,
     ) -> None:
         self.rvol_breakout_mult = rvol_breakout_mult
         self.pullback_vol_frac = pullback_vol_frac
@@ -223,6 +225,7 @@ class VolumeSweetSpotEngine:
         self.adx_min = adx_min
         self.chop_max = chop_max
         self.mtf_align_enabled = mtf_align_enabled
+        self.phase1_gate_enabled = phase1_gate_enabled
 
     def reason(self, obs: AgentObservation) -> Decision:
         ind = obs.indicators
@@ -370,6 +373,10 @@ class VolumeSweetSpotEngine:
                 logger.info("SKIP %s | %s", symbol, mtf_detail)
                 return Decision.hold(symbol, mtf_detail)
 
+        if self.phase1_gate_enabled and extras.get("phase1_allow") is False:
+            p1 = str(extras.get("phase1_reason") or "phase1: blocked")
+            logger.info("SKIP %s | %s", symbol, p1)
+            return Decision.hold(symbol, p1)
 
         swing_low = meta.get("swing_low") or extras.get("swing_low")
         if swing_low is None and obs.htf and obs.htf.swing_low is not None:

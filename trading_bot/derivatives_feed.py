@@ -14,6 +14,16 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
+from trading_bot.cvd import (
+    DEFAULT_CVD_PERIOD_SEC,
+    DEFAULT_LIQ_SWEEP_NOTIONAL_USD,
+    DEFAULT_LIQ_SWEEP_WINDOW_SEC,
+    CvdSnapshot,
+    CvdTracker,
+    evaluate_phase1_long_gates,
+    is_short_liquidation,
+)
+
 logger = logging.getLogger(__name__)
 
 # Coinbase spot → USDT-M perp symbol
@@ -175,6 +185,10 @@ class PerpLeadLagEngine:
         signal_ttl_sec: float = 30.0,
         avg_trade_window: int = 200,
         on_signal: Optional[Callable[[LeadLagSnapshot], None]] = None,
+        cvd_period_sec: float = DEFAULT_CVD_PERIOD_SEC,
+        short_liq_window_sec: float = DEFAULT_LIQ_SWEEP_WINDOW_SEC,
+        short_liq_notional_threshold: float = DEFAULT_LIQ_SWEEP_NOTIONAL_USD,
+        short_liq_ttl_sec: Optional[float] = None,
     ) -> None:
         self.enabled = bool(enabled)
         self.venues = [v.strip().lower() for v in (venues or "binance").split(",") if v.strip()]
@@ -188,6 +202,21 @@ class PerpLeadLagEngine:
         self.signal_ttl_sec = float(signal_ttl_sec)
         self.avg_trade_window = int(avg_trade_window)
         self.on_signal = on_signal
+        self.cvd_period_sec = float(cvd_period_sec) if cvd_period_sec else DEFAULT_CVD_PERIOD_SEC
+        self.short_liq_window_sec = (
+            float(short_liq_window_sec) if short_liq_window_sec else DEFAULT_LIQ_SWEEP_WINDOW_SEC
+        )
+        self.short_liq_notional_threshold = (
+            float(short_liq_notional_threshold)
+            if short_liq_notional_threshold
+            else DEFAULT_LIQ_SWEEP_NOTIONAL_USD
+        )
+        self.short_liq_ttl_sec = (
+            float(short_liq_ttl_sec)
+            if short_liq_ttl_sec is not None
+            else float(signal_ttl_sec)
+        )
+        self.cvd = CvdTracker(period_sec=self.cvd_period_sec)
 
         self._lock = threading.RLock()
         self._buy_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)  # ts, notional
@@ -195,6 +224,11 @@ class PerpLeadLagEngine:
         self._liq_events: Dict[str, Deque[float]] = defaultdict(deque)  # ts
         self._sweep_until: Dict[str, float] = {}
         self._liq_until: Dict[str, float] = {}
+        # Short-liquidation notional in a rolling window (Phase 1 sweep gate)
+        self._short_liq_events: Dict[str, Deque[Tuple[float, float]]] = defaultdict(deque)
+        self._short_liq_sum: Dict[str, float] = defaultdict(float)
+        self._short_liq_spike_until: Dict[str, float] = {}
+        self._liq_msg_count: Dict[str, int] = defaultdict(int)
         self._tasks: List[asyncio.Task] = []
         self._stop = asyncio.Event()
         self._running = False
@@ -257,16 +291,71 @@ class PerpLeadLagEngine:
                             self.sweep_mult,
                         )
                         self._emit()
+        # O(1) CVD — own lock; never do heavy work on the WS callback
+        try:
+            self.cvd.ingest(
+                spot,
+                qty=qty,
+                price=price,
+                is_buyer_maker=is_buyer_maker,
+                ts=now,
+            )
+        except Exception as exc:
+            logger.debug("cvd ingest: %s", exc)
 
-    def ingest_liquidation(self, perp: str, *, ts: Optional[float] = None) -> None:
+    def ingest_liquidation(
+        self,
+        perp: str,
+        *,
+        ts: Optional[float] = None,
+        side: Optional[str] = None,
+        qty: Optional[float] = None,
+        price: Optional[float] = None,
+        notional: Optional[float] = None,
+    ) -> None:
         spot = perp_to_coinbase(perp) or perp
         now = ts if ts is not None else time.time()
+        liq_notional = 0.0
+        if notional is not None:
+            try:
+                liq_notional = abs(float(notional))
+            except (TypeError, ValueError):
+                liq_notional = 0.0
+        elif qty is not None and price is not None:
+            try:
+                liq_notional = abs(float(qty) * float(price))
+            except (TypeError, ValueError):
+                liq_notional = 0.0
+        short = is_short_liquidation(side)
         with self._lock:
+            self._liq_msg_count[spot] += 1
             ev = self._liq_events[spot]
             ev.append(now)
             cutoff = now - self.liq_window_sec
             while ev and ev[0] < cutoff:
                 ev.popleft()
+            if short and liq_notional > 0:
+                shorts = self._short_liq_events[spot]
+                shorts.append((now, liq_notional))
+                self._short_liq_sum[spot] += liq_notional
+                short_cutoff = now - self.short_liq_window_sec
+                while shorts and shorts[0][0] < short_cutoff:
+                    _, n = shorts.popleft()
+                    self._short_liq_sum[spot] -= n
+                if self._short_liq_sum[spot] < 0:
+                    self._short_liq_sum[spot] = 0.0
+                window_sum = float(self._short_liq_sum[spot])
+                if window_sum + 1e-9 >= self.short_liq_notional_threshold:
+                    was_spike = self._short_liq_spike_until.get(spot, 0) > now
+                    self._short_liq_spike_until[spot] = now + self.short_liq_ttl_sec
+                    if not was_spike:
+                        logger.info(
+                            "PERP_LEADLAG short_liq_spike %s notional=%.0f window=%.0fs thresh=%.0f",
+                            spot,
+                            window_sum,
+                            self.short_liq_window_sec,
+                            self.short_liq_notional_threshold,
+                        )
             if detect_liq_cascade(len(ev), min_cluster=self.liq_min_cluster):
                 was_hot = self._liq_until.get(spot, 0) > now
                 self._liq_until[spot] = now + self.signal_ttl_sec
@@ -278,6 +367,82 @@ class PerpLeadLagEngine:
                         self.liq_window_sec,
                     )
                     self._emit()
+
+    def get_cvd_snapshot(self, symbol: str) -> CvdSnapshot:
+        return self.cvd.snapshot((symbol or "").strip().upper())
+
+    def short_liq_notional(self, symbol: str, *, now: Optional[float] = None) -> float:
+        """Rolling short-liquidation notional (USD) for ``symbol``."""
+        spot = (symbol or "").strip().upper()
+        t = float(now) if now is not None else time.time()
+        with self._lock:
+            shorts = self._short_liq_events.get(spot)
+            if not shorts:
+                return 0.0
+            cutoff = t - self.short_liq_window_sec
+            while shorts and shorts[0][0] < cutoff:
+                _, n = shorts.popleft()
+                self._short_liq_sum[spot] -= n
+            if self._short_liq_sum[spot] < 0:
+                self._short_liq_sum[spot] = 0.0
+            return float(self._short_liq_sum.get(spot, 0.0))
+
+    def has_short_liq_spike(self, symbol: str, *, now: Optional[float] = None) -> bool:
+        spot = (symbol or "").strip().upper()
+        t = float(now) if now is not None else time.time()
+        if self.short_liq_notional(spot, now=t) + 1e-9 >= self.short_liq_notional_threshold:
+            return True
+        with self._lock:
+            return self._short_liq_spike_until.get(spot, 0.0) > t
+
+    def tape_warm(self, symbol: str) -> bool:
+        """True after at least one aggTrade for this spot (same WS as forceOrder)."""
+        return self.cvd.trade_count((symbol or "").strip().upper()) > 0
+
+    def evaluate_phase1_long(
+        self,
+        symbol: str,
+        *,
+        candle_open: Optional[float],
+        candle_close: Optional[float],
+        candle_period_start: Optional[int],
+        cvd_enabled: bool = True,
+        liq_enabled: bool = True,
+        liq_threshold: Optional[float] = None,
+        fail_closed: bool = True,
+        allow_cold_feed: bool = False,
+        now: Optional[float] = None,
+    ) -> Tuple[bool, str]:
+        """BUY gates: CVD absorption + short-liq sweep. Non-blocking snapshot read."""
+        spot = (symbol or "").strip().upper()
+        snap = self.cvd.snapshot(spot)
+        period_delta = snap.delta_for(candle_period_start)
+        if period_delta is None and candle_period_start is not None:
+            period_delta = self.cvd.period_delta(spot, candle_period_start)
+        tape = snap.warm or self.tape_warm(spot)
+        notional = self.short_liq_notional(spot, now=now)
+        t = float(now) if now is not None else time.time()
+        with self._lock:
+            latched = self._short_liq_spike_until.get(spot, 0.0) > t
+        thresh = (
+            float(liq_threshold)
+            if liq_threshold is not None
+            else self.short_liq_notional_threshold
+        )
+        return evaluate_phase1_long_gates(
+            candle_open=candle_open,
+            candle_close=candle_close,
+            period_cvd_delta=period_delta,
+            short_liq_notional=notional,
+            cvd_enabled=cvd_enabled,
+            liq_enabled=liq_enabled,
+            liq_threshold=thresh,
+            cvd_feed_warm=tape,
+            liq_feed_warm=tape,
+            fail_closed=fail_closed,
+            allow_cold_feed=allow_cold_feed,
+            spike_latched=latched,
+        )
 
     def _emit(self) -> None:
         if self.on_signal is None:
@@ -295,6 +460,14 @@ class PerpLeadLagEngine:
             self._liq_events.clear()
             self._sweep_until.clear()
             self._liq_until.clear()
+            self._short_liq_events.clear()
+            self._short_liq_sum.clear()
+            self._short_liq_spike_until.clear()
+            self._liq_msg_count.clear()
+        try:
+            self.cvd.clear()
+        except Exception:
+            pass
         logger.debug("PerpLeadLagEngine buffers cleared")
 
     async def start(self) -> None:
@@ -362,9 +535,14 @@ class PerpLeadLagEngine:
                                 )
                             elif et == "forceOrder":
                                 o = data.get("o") or {}
+                                qty_raw = o.get("z") or o.get("q") or o.get("l") or 0
+                                px_raw = o.get("ap") or o.get("p") or 0
                                 self.ingest_liquidation(
                                     str(o.get("s") or data.get("s") or ""),
                                     ts=float(o.get("T") or 0) / 1000.0 if o.get("T") else None,
+                                    side=o.get("S") or o.get("side"),
+                                    qty=float(qty_raw or 0),
+                                    price=float(px_raw or 0),
                                 )
                         except Exception as exc:
                             logger.debug("binance msg parse: %s", exc)
@@ -418,8 +596,19 @@ class PerpLeadLagEngine:
                             elif topic.startswith("allLiquidation.") and data is not None:
                                 perp = topic.split(".", 1)[-1]
                                 rows = data if isinstance(data, list) else [data]
-                                for _ in rows:
-                                    self.ingest_liquidation(perp)
+                                for row in rows:
+                                    if not isinstance(row, dict):
+                                        self.ingest_liquidation(perp)
+                                        continue
+                                    row_perp = str(row.get("s") or row.get("symbol") or perp)
+                                    ts_raw = row.get("T") or row.get("ts")
+                                    self.ingest_liquidation(
+                                        row_perp,
+                                        ts=float(ts_raw) / 1000.0 if ts_raw else None,
+                                        side=row.get("S") or row.get("side"),
+                                        qty=float(row.get("v") or row.get("size") or 0),
+                                        price=float(row.get("p") or row.get("price") or 0),
+                                    )
                         except Exception as exc:
                             logger.debug("bybit msg parse: %s", exc)
             except asyncio.CancelledError:
