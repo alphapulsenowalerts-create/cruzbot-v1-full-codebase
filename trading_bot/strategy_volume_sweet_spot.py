@@ -541,3 +541,262 @@ class VolumeSweetSpotEngine:
             limit_price=round(close, 8),  # post-only limit at mark
             reasoning=reason,
         )
+
+
+    def get_entry_proximity(
+        self,
+        obs: Any = None,
+        *,
+        snapshot: Optional[dict] = None,
+        buy_ready: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Non-blocking LONG entry proximity score (0–99.9). No network I/O.
+
+        Weights map to live CruzBot gates:
+          ~40 volume sweet-spot (RVOL / retest / VWAP)
+          ~30 book + regime (L2 imbalance, ADX/chop)
+          ~30 CVD + short-liq sweep
+        """
+        snap: dict[str, Any] = dict(snapshot or {})
+        extras: dict[str, Any] = {}
+        close: Optional[float] = None
+        vwap: Optional[float] = None
+        volume: Optional[float] = None
+        symbol = ""
+        bars: list = []
+        cvd: dict = {}
+        liq: dict = {}
+
+        def _num(val: Any, default: Optional[float] = None) -> Optional[float]:
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        if isinstance(obs, dict):
+            snap = {**obs, **snap}
+
+        if obs is not None and not isinstance(obs, dict):
+            try:
+                symbol = str(getattr(obs, "symbol", "") or "")
+                ind = getattr(obs, "indicators", None)
+                if ind is not None:
+                    extras = dict(getattr(ind, "extras", None) or {})
+                    close = _num(getattr(ind, "close", None))
+                    vwap = _num(getattr(ind, "vwap", None))
+                    volume = _num(getattr(ind, "volume", None))
+                bars = list(getattr(obs, "recent_bars", None) or [])
+                try:
+                    cvd, liq = self._resolve_cvd_liq(obs)
+                except Exception:
+                    cvd, liq = {}, {}
+            except Exception:
+                pass
+
+        # Lightweight snapshot overrides / standalone path
+        if snap:
+            symbol = str(snap.get("symbol") or symbol or "")
+            extras = {**extras, **dict(snap.get("extras") or {})}
+            for k in (
+                "volume_ratio",
+                "breakout_rvol",
+                "retest_ok",
+                "breakout_volume",
+                "pullback_volume",
+                "on_breakout_spike",
+                "l2_imbalance_ratio",
+                "l2_imbalance",
+                "adx",
+                "chop",
+                "choppiness",
+                "setup_bar_open",
+                "setup_bar_close",
+                "open",
+                "cvd_5m",
+                "cvd_1m",
+                "short_liq_1m_usd",
+                "long_liq_1m_usd",
+                "cvd_ready",
+                "liq_ready",
+            ):
+                if k in snap and k not in extras:
+                    extras[k] = snap[k]
+            if snap.get("close") is not None:
+                close = _num(snap.get("close"), close)
+            if snap.get("vwap") is not None:
+                vwap = _num(snap.get("vwap"), vwap)
+            if snap.get("volume") is not None:
+                volume = _num(snap.get("volume"), volume)
+            raw_cvd = snap.get("cvd_snapshot")
+            if isinstance(raw_cvd, dict):
+                cvd = dict(raw_cvd)
+            raw_liq = snap.get("liq_snapshot")
+            if isinstance(raw_liq, dict):
+                liq = dict(raw_liq)
+
+        if not cvd and ("cvd_5m" in extras or "cvd_1m" in extras):
+            cvd = {
+                "cvd_1m": extras.get("cvd_1m"),
+                "cvd_5m": extras.get("cvd_5m"),
+                "ready": extras.get("cvd_ready", True),
+            }
+        if not liq and (
+            "short_liq_1m_usd" in extras or "long_liq_1m_usd" in extras
+        ):
+            liq = {
+                "short_liq_1m_usd": extras.get("short_liq_1m_usd"),
+                "long_liq_1m_usd": extras.get("long_liq_1m_usd"),
+                "ready": extras.get("liq_ready", True),
+            }
+
+        # --- ~40 pts: volume sweet-spot / RVOL + retest + VWAP ---
+        rvol = _num(extras.get("volume_ratio"), None)
+        if rvol is None:
+            rvol = _num(extras.get("breakout_rvol"), 0.0) or 0.0
+        thresh = float(self.rvol_breakout_mult) or 2.0
+        rvol_pts = min(15.0, max(0.0, (float(rvol) / thresh) * 15.0)) if thresh > 0 else 0.0
+
+        retest_ok = extras.get("retest_ok") is True
+        bvol = _num(extras.get("breakout_volume"))
+        pvol = _num(extras.get("pullback_volume"), volume)
+        on_spike = extras.get("on_breakout_spike") is True
+        target_frac = float(self.pullback_vol_frac) or 0.5
+        if retest_ok:
+            pullback_pts = 15.0
+        elif bvol is not None and bvol > 0 and pvol is not None:
+            frac = float(pvol) / float(bvol)
+            if frac <= target_frac:
+                pullback_pts = 15.0
+            elif frac >= 1.0:
+                pullback_pts = 0.0
+            else:
+                span = max(1e-9, 1.0 - target_frac)
+                pullback_pts = max(0.0, 15.0 * (1.0 - (frac - target_frac) / span))
+        elif on_spike:
+            pullback_pts = 2.0
+        else:
+            pullback_pts = 4.0
+
+        vwap_pts = 3.0
+        if close is not None and vwap is not None and float(vwap) > 0:
+            dist = (float(close) - float(vwap)) / float(vwap)
+            if 0.0 <= dist <= 0.005:
+                vwap_pts = 10.0  # classic retest zone at/just above VWAP
+            elif 0.005 < dist <= 0.02:
+                vwap_pts = 7.0
+            elif -0.01 <= dist < 0.0:
+                vwap_pts = 6.0
+            elif dist < -0.01:
+                vwap_pts = 2.0
+            else:
+                vwap_pts = 4.0  # extended above VWAP
+
+        volume_part = min(40.0, rvol_pts + pullback_pts + vwap_pts)
+
+        # --- ~30 pts: L2 book + regime (ADX/chop) ---
+        ratio = extras.get("l2_imbalance_ratio")
+        if ratio is None:
+            ratio = extras.get("l2_imbalance")
+        min_r = float(self.l2_imbalance_min_ratio) or 1.2
+        ratio_f = _num(ratio)
+        if ratio_f is not None and min_r > 0:
+            l2_pts = min(15.0, max(0.0, (float(ratio_f) / min_r) * 15.0))
+        else:
+            l2_pts = 5.0  # no book cached — mild neutral credit
+
+        adx_v = _num(extras.get("adx"))
+        chop_v = _num(extras.get("chop"), _num(extras.get("choppiness")))
+        adx_min = float(self.adx_min) or 25.0
+        chop_max = float(self.chop_max) or 60.0
+        if adx_v is None and chop_v is None:
+            regime_pts = 7.0
+        else:
+            adx_frac = 0.5
+            if adx_v is not None and adx_min > 0:
+                adx_frac = min(1.0, max(0.0, float(adx_v) / adx_min))
+            chop_frac = 0.5
+            if chop_v is not None and chop_max > 0:
+                if float(chop_v) <= chop_max:
+                    chop_frac = max(0.0, 1.0 - float(chop_v) / chop_max)
+                else:
+                    over = (float(chop_v) - chop_max) / chop_max
+                    chop_frac = max(0.0, 0.25 * (1.0 - min(1.0, over)))
+            regime_pts = 15.0 * (0.55 * adx_frac + 0.45 * chop_frac)
+
+        book_part = min(30.0, l2_pts + regime_pts)
+
+        # --- ~30 pts: CVD + short-liq sweep ---
+        bar_o: Optional[float] = None
+        bar_c: Optional[float] = None
+        if obs is not None and not isinstance(obs, dict):
+            try:
+                bar_o, bar_c = self._setup_bar_open_close(obs, bars)
+            except Exception:
+                bar_o, bar_c = None, None
+        if bar_o is None:
+            bar_o = _num(extras.get("setup_bar_open"), _num(extras.get("open")))
+        if bar_c is None:
+            bar_c = _num(extras.get("setup_bar_close"), close)
+
+        cvd_5m = _num((cvd or {}).get("cvd_5m"), _num(extras.get("cvd_5m")))
+        if cvd_5m is None:
+            cvd_pts = 7.0
+        else:
+            green = (
+                bar_o is not None
+                and bar_c is not None
+                and float(bar_c) > float(bar_o)
+            )
+            if green and float(cvd_5m) < 0:
+                cvd_pts = 1.0  # green + negative CVD — strongly lower
+            elif float(cvd_5m) > 0:
+                # Positive CVD supports longs; soft scale
+                mag = min(1.0, abs(float(cvd_5m)) / 250_000.0)
+                cvd_pts = 8.0 + 7.0 * mag
+            elif float(cvd_5m) < 0:
+                cvd_pts = 5.0
+            else:
+                cvd_pts = 7.0
+
+        short_liq = _num(
+            (liq or {}).get("short_liq_1m_usd"),
+            _num(extras.get("short_liq_1m_usd")),
+        )
+        liq_thresh = float(self.liq_sweep_short_usd) or 50_000.0
+        if short_liq is None:
+            liq_pts = 3.0
+        elif liq_thresh > 0:
+            liq_pts = min(15.0, max(0.0, (float(short_liq) / liq_thresh) * 15.0))
+        else:
+            liq_pts = 0.0
+
+        cvd_liq_part = min(30.0, cvd_pts + liq_pts)
+
+        raw = float(volume_part) + float(book_part) + float(cvd_liq_part)
+        if buy_ready:
+            score = 99.9
+        else:
+            score = min(99.9, raw)
+        score = round(max(0.0, float(score)), 1)
+
+        direction = "LONG" if score >= 30.0 else "HOLD"
+        return {
+            "direction": direction,
+            "score": score,
+            "parts": {
+                "volume": round(float(volume_part), 1),
+                "book_regime": round(float(book_part), 1),
+                "cvd_liq": round(float(cvd_liq_part), 1),
+                "rvol_pts": round(float(rvol_pts), 1),
+                "pullback_pts": round(float(pullback_pts), 1),
+                "vwap_pts": round(float(vwap_pts), 1),
+                "l2_pts": round(float(l2_pts), 1),
+                "regime_pts": round(float(regime_pts), 1),
+                "cvd_pts": round(float(cvd_pts), 1),
+                "liq_pts": round(float(liq_pts), 1),
+                "symbol": symbol or None,
+            },
+        }

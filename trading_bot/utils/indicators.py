@@ -556,3 +556,17 @@ def check_liq_sweep(
             return False, "liq_sweep: short liq 1m < $50k"
         return False, f"liq_sweep: short liq 1m < ${thresh:,.0f}"
     return True, f"liq_sweep ok short_liq_1m=${short_usd:,.0f} >= ${thresh:,.0f}"
+
+
+def make_progress_bar(percentage: float, length: int = 10) -> str:
+    """Clamp 0–100; filled ``█``, empty ``░``; format ``[█████░░░░░] 50.0%``."""
+    try:
+        pct = float(percentage)
+    except (TypeError, ValueError):
+        pct = 0.0
+    pct = max(0.0, min(100.0, pct))
+    length_i = max(1, int(length))
+    filled = int(round(pct / 100.0 * length_i))
+    filled = max(0, min(length_i, filled))
+    bar = "█" * filled + "░" * (length_i - filled)
+    return f"[{bar}] {pct:.1f}%"
