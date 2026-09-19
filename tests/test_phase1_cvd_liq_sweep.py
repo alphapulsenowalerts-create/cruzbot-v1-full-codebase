@@ -177,7 +177,7 @@ def test_phase1_compose_divergence_wins():
 
 def test_last_closed_5m_skips_forming_bar():
     period = 300
-    p0 = 1_700_000_000
+    p0 = period_start_ts(1_700_000_000, period)
     p1 = p0 + period
     now = p1 + 10  # second bar still forming
     df = pd.DataFrame(
@@ -454,14 +454,15 @@ def test_trading_app_phase1_gate_fail_closed_and_warmup(tmp_path, monkeypatch):
 
     # Seed tape + short-liq spike + matching 5m CVD → allow
     object.__setattr__(app.settings, "phase1_allow_cold_feed", False)
-    p0 = period_start_ts(1_700_600_000.0, 300)
+    now = time.time()
+    p0 = period_start_ts(now - 400.0, 300)
     app.leadlag.ingest_agg_trade(
         "BTCUSDT", qty=1.0, price=100.0, is_buyer_maker=False, ts=p0 + 1
     )
     app.leadlag.ingest_liquidation(
-        "BTCUSDT", side="BUY", qty=1.0, price=60_000.0, ts=p0 + 2
+        "BTCUSDT", side="BUY", qty=1.0, price=60_000.0, ts=now - 5.0
     )
     app._phase1_closed_5m = lambda _sym: (100.0, 101.0, p0)  # type: ignore[method-assign]
     ok3, reason3 = app._phase1_allow_buy("BTC-USD")
-    assert ok3 is True
+    assert ok3 is True, reason3
     assert reason3 == ""
