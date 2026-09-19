@@ -36,8 +36,6 @@ from trading_bot.config import (
     reload_settings,
     upsert_env_vars,
 )
-# config_import_expanded
-from trading_bot.config import_PLACEHOLDER_
 from trading_bot.data_feed import DataFeed
 from trading_bot.executor import Executor
 from trading_bot.logger import TradeLogger, setup_logging
