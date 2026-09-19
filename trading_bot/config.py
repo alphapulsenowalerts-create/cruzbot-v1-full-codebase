@@ -40,16 +40,16 @@ class Settings(BaseSettings):
     paper_trading_mode: bool = Field(default=True, alias="PAPER_TRADING_MODE")
     dry_run: bool = Field(default=False, alias="DRY_RUN")
 
-    # Account — Al locked $200 trading book (Coinbase crypto VWAP scalps)
-    account_equity: float = Field(default=200.0, alias="ACCOUNT_EQUITY")
+    # Account — Al locked $1,600 trading book (Coinbase crypto VWAP scalps)
+    account_equity: float = Field(default=1600.0, alias="ACCOUNT_EQUITY")
     symbols: str = Field(
         default="BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,SUI-USD,ADA-USD",
         alias="SYMBOLS",
     )
     # Absolute live caps (not merely % of book)
-    max_notional_per_trade_usd: float = Field(default=50.0, alias="MAX_NOTIONAL_PER_TRADE_USD")
+    max_notional_per_trade_usd: float = Field(default=100.0, alias="MAX_NOTIONAL_PER_TRADE_USD")
     min_notional_usd: float = Field(default=10.0, alias="MIN_NOTIONAL_USD")
-    max_total_exposure_usd: float = Field(default=200.0, alias="MAX_TOTAL_EXPOSURE_USD")
+    max_total_exposure_usd: float = Field(default=1000.0, alias="MAX_TOTAL_EXPOSURE_USD")
     qty_precision: int = Field(default=8, alias="QTY_PRECISION")
     quiet_notifier: bool = Field(default=True, alias="QUIET_NOTIFIER")
     # Max hold before hard time-stop exit (minutes). Sweet-spot default 30.

@@ -37,7 +37,7 @@ class RiskManager:
     """
     Enforces Al's locked production risk:
     - Hard symbol allowlist only
-    - Max $50 notional per trade, $200 total live exposure
+    - Max $100 notional per trade, $1000 total live exposure
     - Stops: volume_sweet_spot uses structural SL + R-multiple TP (no ATR trail);
       legacy vwap_scalp uses ATR SL/TP/trail
     - 1–2% equity risk per trade (ceiling 2%)
@@ -148,7 +148,7 @@ class RiskManager:
     ) -> tuple[float, float, float]:
         """
         Size qty from stop distance so $risk <= max_risk_pct * equity,
-        then apply absolute $50/trade and remaining $200 exposure caps.
+        then apply absolute $100/trade and remaining $1000 exposure caps.
         Optional ATR scaling shrinks/grows notional within [min, $50] hard cap.
         Uses fractional crypto qty (floored to qty_precision) — never int() whole-coins.
         """

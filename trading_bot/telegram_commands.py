@@ -1,7 +1,7 @@
 """Interactive Telegram command long-poll (authorized chat only).
 
 User-initiated replies only — never unsolicited status spam.
-Commands: /status /pause /resume /pnl /kill /mode /confirm_live
+Commands: /status /pause /resume /pnl /kill /mode /confirm_live /set_limit
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ _CT = ZoneInfo("America/Chicago")
 CommandHandler = Callable[[str, List[str]], Awaitable[str]]
 
 KNOWN_COMMANDS = frozenset(
-    {"status", "pause", "resume", "pnl", "kill", "mode", "confirm_live"}
+    {"status", "pause", "resume", "pnl", "kill", "mode", "confirm_live", "set_limit"}
 )
 
 LIVE_CONFIRM_TTL_SECONDS = 90.0
@@ -33,6 +33,11 @@ REPLY_CONFIRM_EXPIRED = (
 )
 ALERT_LIVE_ACTIVATED = "LIVE MODE ACTIVATED — real capital."
 ALERT_PAPER_RESTORED = "PAPER MODE RESTORED."
+
+REPLY_SET_LIMIT_USAGE = (
+    "Usage: /set_limit <trade_cap> <max_book> "
+    "(positive dollars; max_book >= trade_cap) e.g. /set_limit 100 1000"
+)
 
 
 
@@ -61,10 +66,23 @@ def format_status_reply(
     paused: bool,
     strategy_mode: str,
     last_tick_age_seconds: Optional[float],
-    pid: int,
+    pid: int = 0,
     paper: bool = True,
+    entry_proximity: Optional[Dict[str, Any]] = None,
+    proximity_symbol: Optional[str] = None,
+    proximity_price: Optional[float] = None,
+    allowlist_symbols: Optional[Sequence[str]] = None,
+    starting_equity: Optional[float] = None,
+    trade_cap: Optional[float] = None,
+    max_exposure: Optional[float] = None,
 ) -> str:
-    """Brief /status reply text."""
+    """Brief /status reply text (optional entry-proximity bar).
+
+    pid is accepted for back-compat but never shown.
+    Allowlist symbols are listed at the bottom when provided.
+    """
+    from trading_bot.utils.indicators import make_progress_bar
+
     nl = chr(10)
     mode = "PAPER" if paper else "LIVE"
     pause_s = "PAUSED (no new buys)" if paused else "running"
@@ -75,23 +93,52 @@ def format_status_reply(
     lines = [
         f"CruzBot {mode} status",
         f"cash=${float(paper_cash):.2f} equity=${float(paper_equity):.2f}",
+        (
+            f"baseline=${float(starting_equity):.2f}"
+            if starting_equity is not None
+            else None
+        ),
+        (
+            f"Active Caps: ${float(trade_cap):.0f}/trade | ${float(max_exposure):.0f} exposure"
+            if trade_cap is not None and max_exposure is not None
+            else None
+        ),
         f"pause={pause_s}",
         f"strategy={strategy_mode}",
         f"last_tick_age={tick_s}",
-        f"pid={pid}",
     ]
+    lines = [x for x in lines if x is not None]
+    if entry_proximity is not None:
+        direction = str(entry_proximity.get("direction") or "HOLD")
+        try:
+            score = float(entry_proximity.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        lines.append(f"Target Setup: {direction}")
+        lines.append(f"Entry Proximity: {make_progress_bar(score)}")
+        if proximity_symbol:
+            if proximity_price is not None and float(proximity_price) > 0:
+                lines.append(
+                    f"focus={proximity_symbol} @ ${float(proximity_price):,.2f}"
+                )
+            else:
+                lines.append(f"focus={proximity_symbol}")
     if not positions:
         lines.append("positions: (none)")
     else:
         lines.append(f"positions ({len(positions)}):")
-        for p in positions:
-            sym = p.get("symbol") or "?"
-            qty = float(p.get("qty") or 0)
-            entry = p.get("avg_entry_price")
-            mv = p.get("market_value")
+        for pos in positions:
+            sym = pos.get("symbol") or "?"
+            qty = float(pos.get("qty") or 0)
+            entry = pos.get("avg_entry_price")
+            mv = pos.get("market_value")
             entry_s = f"${float(entry):.4g}" if entry is not None else "?"
             mv_s = f"${float(mv):.2f}" if mv is not None else "?"
             lines.append(f"  {sym} qty={qty:.6g} entry={entry_s} mv={mv_s}")
+    if allowlist_symbols:
+        syms = [str(s).strip() for s in allowlist_symbols if str(s).strip()]
+        if syms:
+            lines.append("allowlist: " + ", ".join(syms))
     return nl.join(lines)
 
 
@@ -99,6 +146,36 @@ def format_mode_reply(*, paper: bool, cash: float, equity: float) -> str:
     """Brief /mode reply: MODE: PAPER|LIVE plus cash/equity one-liner."""
     mode = "PAPER" if paper else "LIVE"
     return f"MODE: {mode} | cash=${float(cash):.2f} equity=${float(equity):.2f}"
+
+
+def parse_set_limit_args(
+    args: Sequence[str],
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    """Parse /set_limit args → (trade_cap, max_book, error).
+
+    On success error is None. Rejects non-positive or max_book < trade_cap.
+    """
+    if len(args) != 2:
+        return None, None, REPLY_SET_LIMIT_USAGE
+    try:
+        trade_cap = float(str(args[0]).strip().replace(",", "").replace("$", ""))
+        max_book = float(str(args[1]).strip().replace(",", "").replace("$", ""))
+    except (TypeError, ValueError):
+        return None, None, REPLY_SET_LIMIT_USAGE
+    if not (trade_cap > 0 and max_book > 0):
+        return None, None, REPLY_SET_LIMIT_USAGE
+    if max_book < trade_cap:
+        return None, None, REPLY_SET_LIMIT_USAGE
+    return float(trade_cap), float(max_book), None
+
+
+def format_set_limit_reply(trade_cap: float, max_book: float) -> str:
+    """Success reply: Trade cap updated to $X.XX | Max book updated to $Y.YY"""
+    return (
+        f"Trade cap updated to ${float(trade_cap):.2f} | "
+        f"Max book updated to ${float(max_book):.2f}"
+    )
+
 
 
 def day_trades_from_ledger(
@@ -323,7 +400,7 @@ class TelegramCommandListener:
             return
         self._running = True
         logger.info(
-            "Telegram commands armed (chat_id=%s) — /status /pause /resume /pnl /kill /mode /confirm_live",
+            "Telegram commands armed (chat_id=%s) — /status /pause /resume /pnl /kill /mode /confirm_live /set_limit",
             self.chat_id,
         )
         # Drop pending updates so we don't reply to stale commands after restart
