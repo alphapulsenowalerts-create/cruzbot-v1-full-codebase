@@ -1,0 +1,26 @@
+# CruzBot paper trading loop — systemd unit
+# Install (user): cp deploy/cruzbot.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now cruzbot
+# Install (system): sudo cp deploy/cruzbot.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now cruzbot
+# Replace User= and WorkingDirectory with your box account / checkout path.
+
+[Unit]
+Description=CruzBot paper day-trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Placeholder — set to the Linux user that owns the checkout (e.g. box)
+User=box
+Group=box
+WorkingDirectory=/workspace/agentic-day-trading-bot/agentic-day-trading-bot
+EnvironmentFile=/workspace/agentic-day-trading-bot/agentic-day-trading-bot/.env
+ExecStart=/workspace/agentic-day-trading-bot/agentic-day-trading-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+# Keep PAPER_TRADING_MODE=true in .env — do not arm live via this unit
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
