@@ -1,6 +1,8 @@
-# Agentic Day Trading Bot
+# Kraken Instance #2
 
-**Peer bots (Coinbase / Agentic):** Kraken Instance #2 lives at [`instances/kraken-instance-2/`](instances/kraken-instance-2/). Start with [`MASTER_SYSTEM_ARCHIVE.md`](instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md) (Tier-1 stack). Paper-first. Copy `.env.example` locally. Never commit secrets.
+Trading code for peer bots. Authoritative Tier-1 stack: [`MASTER_SYSTEM_ARCHIVE.md`](MASTER_SYSTEM_ARCHIVE.md). Paper-first. Copy `.env.example` (or `.env.instance2.example`) → `.env` locally. No secrets in this repo.
+
+# Agentic Day Trading Bot
 
 Production-oriented **paper** day-trading bot for a **$200** portfolio. Asyncio I/O, pydantic schemas, modular broker adapters (Alpaca paper; **Coinbase Advanced Trade** for crypto; IB stub; Mock for dry-run), ReAct-style agent loop, and hard risk controls.
 
@@ -28,9 +30,9 @@ MAX_POSITION_PCT=0.20
 MAX_RISK_PER_TRADE_PCT=0.015
 MAX_RISK_PER_TRADE_PCT_CEILING=0.02
 DAILY_DRAWDOWN_LIMIT_PCT=0.03
-MAX_NOTIONAL_PER_TRADE_USD=50
-MAX_TOTAL_EXPOSURE_USD=200
-ACCOUNT_EQUITY=200
+MAX_NOTIONAL_PER_TRADE_USD=100
+MAX_TOTAL_EXPOSURE_USD=1000
+ACCOUNT_EQUITY=1600
 ```
 
 Keep paper mode on until the loop, sizing, and kill-switch are verified end-to-end. Do not place live orders until you intentionally accept that risk.
@@ -173,7 +175,7 @@ python -m pytest -q
 
 | Control | Value |
 |---------|--------|
-| Trading book (ACCOUNT_EQUITY) | $200 |
+| Trading book (ACCOUNT_EQUITY) | $1600 |
 | Max notional per trade | $50 |
 | Max total live exposure | $200 |
 | Risk per trade | 1.5% (ceiling 2%) |
@@ -185,3 +187,7 @@ python -m pytest -q
 ## Project layout
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the dependency map.
+
+## Whop sales webhook
+
+`python deploy/whop_webhook.py` — aiohttp on port **5001**; Telegram alert brand: **Apex Signals Now**. Secrets from env only.
