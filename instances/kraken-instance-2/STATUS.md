@@ -5,12 +5,11 @@
 - State: `data/trading_bot.db`, `data/paper_book.json`, `data/active_params.json`
 - Do **not** merge PR #1 or any Kraken / Instance #2 branch into `main`
 
-**Instance #2 — Kraken paper (sibling folder, do not mix state)**
-- Path: [`instances/kraken-instance-2/`](instances/kraken-instance-2/)
-- Archive: [`instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md`](instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md)
-- Own `.env` (from `.env.example`), SQLite, and paper book (`*_2` paths)
-- Do **not** overwrite root Coinbase `main.py` / `trading_bot/` with the Kraken tree
-- Older draft PR #1 mixed Kraken into root — prefer this folder over that overlay
+**Instance #2 — Kraken paper (this folder)**
+- Path: `instances/kraken-instance-2/`
+- Archive: `MASTER_SYSTEM_ARCHIVE.md` (Tier-1 Winning Formula)
+- Must use its own `.env`, SQLite, and paper book (`*_2` paths)
+- Never share secrets or DBs with Instance #1
 
 ---
 

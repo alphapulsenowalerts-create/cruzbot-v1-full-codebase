@@ -14,8 +14,8 @@ A complete, locked Python asyncio day-trading bot. Unzip → venv → copy `.env
 ---
 ## Codebase separation (do not mix)
 
-- **This handoff / repo root = Instance #1 Coinbase only** (Chief of Staff / primary CruzBot).
-- **Kraken Instance #2** lives in [`instances/kraken-instance-2/`](instances/kraken-instance-2/) with [`MASTER_SYSTEM_ARCHIVE.md`](instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md).
+- **Repo root `main` = Instance #1 Coinbase only.**
+- **Kraken Instance #2** lives in `instances/kraken-instance-2/` (see `MASTER_SYSTEM_ARCHIVE.md`).
 - Never share SQLite, paper book, or `.env` between instances.
 
 

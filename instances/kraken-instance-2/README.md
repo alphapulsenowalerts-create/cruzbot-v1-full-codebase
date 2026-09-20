@@ -1,24 +1,30 @@
-# Agentic Day Trading Bot
+# Kraken Instance #2 (Apex Signals Now)
 
-Production-oriented **paper** day-trading bot for a **$200** portfolio. Asyncio I/O, pydantic schemas, modular broker adapters (Alpaca paper; **Coinbase Advanced Trade** for crypto; IB stub; Mock for dry-run), ReAct-style agent loop, and hard risk controls.
+Peer Coinbase / Agentic bots: **this folder is the Instance #2 trading stack.**
 
-## Instance #2 (Kraken) — peer bot pickup
+| What | Where |
+|------|--------|
+| Trading code | `instances/kraken-instance-2/` (`main.py`, `trading_bot/`, `scripts/`, `tests/`, `deploy/`) |
+| Tier-1 archive | [MASTER_SYSTEM_ARCHIVE.md](MASTER_SYSTEM_ARCHIVE.md) |
+| Paper env templates | [`.env.example`](.env.example) and [`.env.instance2.example`](.env.instance2.example) |
 
-Repo root is **Instance #1 / Coinbase**. The secrets-scrubbed **Kraken Instance #2** stack (Apex Signals Now, Tier-1 Winning Formula) lives in a sibling folder so Coinbase and Agentic agents can clone/pull without mixing brokers or state.
-
-| What | Path |
-|------|------|
-| Trading code | [`instances/kraken-instance-2/`](instances/kraken-instance-2/) |
-| Tier-1 archive | [`instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md`](instances/kraken-instance-2/MASTER_SYSTEM_ARCHIVE.md) |
-| Paper env templates | [`instances/kraken-instance-2/.env.example`](instances/kraken-instance-2/.env.example), [`.env.instance2.example`](instances/kraken-instance-2/.env.instance2.example) |
-
-**Paper-first.** Copy `.env.example` → `.env` locally. **No secrets in this repo** — never commit `.env`, API keys, Telegram tokens, or SQLite DBs. Do not share `data/` or env files with Instance #1.
+**Paper-first.** Copy `.env.example` → `.env` (or `.env.instance2.example` for isolated `*_2` paths). Never commit `.env`, API keys, Telegram tokens, or SQLite DBs. Secrets stay local.
 
 ```bash
 cd instances/kraken-instance-2
-cp .env.example .env
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env          # fill placeholders only
 python main.py --dry-run --once
 ```
+
+Do not mix state with repo-root Instance #1 (Coinbase): separate `.env`, `data/trading_bot_2.db`, `data/paper_book_2.json`.
+
+---
+
+# Agentic Day Trading Bot
+
+Production-oriented **paper** day-trading bot for a **$200** portfolio. Asyncio I/O, pydantic schemas, modular broker adapters (Alpaca paper; **Coinbase Advanced Trade** for crypto; IB stub; Mock for dry-run), ReAct-style agent loop, and hard risk controls.
 
 > **Default: `PAPER_TRADING_MODE=True` everywhere.** Do not disable unless you intentionally accept live risk. Coinbase has no true retail paper portfolio — when `PAPER_TRADING_MODE=true`, the Coinbase adapter **never** submits live orders (logs + simulated fills only).
 
@@ -44,9 +50,9 @@ MAX_POSITION_PCT=0.20
 MAX_RISK_PER_TRADE_PCT=0.015
 MAX_RISK_PER_TRADE_PCT_CEILING=0.02
 DAILY_DRAWDOWN_LIMIT_PCT=0.03
-MAX_NOTIONAL_PER_TRADE_USD=50
-MAX_TOTAL_EXPOSURE_USD=200
-ACCOUNT_EQUITY=200
+MAX_NOTIONAL_PER_TRADE_USD=100
+MAX_TOTAL_EXPOSURE_USD=1000
+ACCOUNT_EQUITY=1600
 ```
 
 Keep paper mode on until the loop, sizing, and kill-switch are verified end-to-end. Do not place live orders until you intentionally accept that risk.
@@ -189,7 +195,7 @@ python -m pytest -q
 
 | Control | Value |
 |---------|--------|
-| Trading book (ACCOUNT_EQUITY) | $200 |
+| Trading book (ACCOUNT_EQUITY) | $1600 |
 | Max notional per trade | $50 |
 | Max total live exposure | $200 |
 | Risk per trade | 1.5% (ceiling 2%) |
@@ -201,3 +207,7 @@ python -m pytest -q
 ## Project layout
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the dependency map.
+
+## Whop sales webhook
+
+`python deploy/whop_webhook.py` — aiohttp on port **5001**; Telegram alert brand: **Apex Signals Now**. Secrets from env only.

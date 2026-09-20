@@ -1,0 +1,15 @@
+[Unit]
+Description=Apex Signals Now / CruzBot Instance #2 (Kraken paper)
+After=network.target
+
+[Service]
+Type=simple
+User=box
+WorkingDirectory=/workspace/instances/kraken-instance-2
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/workspace/instances/kraken-instance-2/.venv/bin/python -u /workspace/instances/kraken-instance-2/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

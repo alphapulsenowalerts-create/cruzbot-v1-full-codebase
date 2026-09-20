@@ -1,0 +1,743 @@
+"""Application configuration loaded from environment / .env."""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Mapping
+
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Canonical production allowlist (order preserved for stable scans).
+# HARD_SYMBOL_ALLOWLIST remains the locked set used when SYMBOL_MODE=ALLOWLIST.
+DEFAULT_SYMBOL_ALLOWLIST: tuple[str, ...] = (
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XRP-USD",
+    "LINK-USD",
+    "AVAX-USD",
+    "SUI-USD",
+    "ADA-USD",
+    "DOGE-USD",
+    "DOT-USD",
+    "ATOM-USD",
+    "LTC-USD",
+    "UNI-USD",
+    "NEAR-USD",
+)
+HARD_SYMBOL_ALLOWLIST: frozenset[str] = frozenset(DEFAULT_SYMBOL_ALLOWLIST)
+
+# Runtime override for SYMBOL_MODE=DYNAMIC_ALL (set by SymbolUniverse).
+# None → fall back to HARD_SYMBOL_ALLOWLIST / SYMBOLS intersection.
+_runtime_active_symbols: list[str] | None = None
+
+
+def normalize_active_symbol(symbol: str) -> str:
+    """Normalize a runtime symbol while preserving Kraken tokenized ``x`` suffix."""
+    raw = str(symbol or "").strip().replace("/", "-").replace("_", "-")
+    if not raw:
+        return ""
+    if "-" in raw:
+        base, quote = raw.split("-", 1)
+    else:
+        base, quote = raw, "USD"
+    base = base.strip()
+    quote = quote.strip().upper()
+    if base.lower().endswith("x"):
+        base = base[:-1].upper() + "x"
+    else:
+        base = base.upper()
+    return f"{base}-{quote}" if quote else base
+
+
+def set_runtime_active_symbols(symbols: list[str] | None) -> None:
+    """Hot-swap the active universe used by Settings.symbol_list / is_allowlisted."""
+    global _runtime_active_symbols
+    if symbols is None:
+        _runtime_active_symbols = None
+        return
+    out: list[str] = []
+    for s in symbols:
+        n = normalize_active_symbol(s)
+        if n and n not in out:
+            out.append(n)
+    _runtime_active_symbols = out
+
+
+def get_runtime_active_symbols() -> list[str] | None:
+    return list(_runtime_active_symbols) if _runtime_active_symbols is not None else None
+
+
+class Settings(BaseSettings):
+    """Runtime settings. Secrets come only from env / .env — never hardcoded."""
+
+    model_config = SettingsConfigDict(
+        env_file=str(PROJECT_ROOT / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Mode
+    paper_trading_mode: bool = Field(default=True, alias="PAPER_TRADING_MODE")
+    dry_run: bool = Field(default=False, alias="DRY_RUN")
+
+    # Account — $1600 paper trading book (crypto VWAP / volume sweet spot)
+    account_equity: float = Field(default=1600.0, alias="ACCOUNT_EQUITY")
+    symbols: str = Field(
+        default="BTC-USD,ETH-USD,SOL-USD,XRP-USD,LINK-USD,AVAX-USD,SUI-USD,ADA-USD,DOGE-USD,DOT-USD,ATOM-USD,LTC-USD,UNI-USD,NEAR-USD",
+        alias="SYMBOLS",
+    )
+    # ALLOWLIST (default) = canonical hard set; DYNAMIC_ALL = Kraken discovery + liquidity filter
+    symbol_mode: str = Field(default="ALLOWLIST", alias="SYMBOL_MODE")
+    # Include Kraken tokenized equities (xStocks) alongside crypto when enabled.
+    universe_stocks: bool = Field(default=False, alias="UNIVERSE_STOCKS")
+    # Absolute live caps (not merely % of book)
+    max_notional_per_trade_usd: float = Field(default=1000.0, alias="MAX_NOTIONAL_PER_TRADE_USD")
+    min_notional_usd: float = Field(default=10.0, alias="MIN_NOTIONAL_USD")
+    max_total_exposure_usd: float = Field(default=3000.0, alias="MAX_TOTAL_EXPOSURE_USD")  # fixed $ cap; not equity-scaled
+    # Entry proximity LONG/WAIT + strategy BUY gate (mutable via /set_threshold)
+    entry_threshold: float = Field(default=60.0, alias="ENTRY_THRESHOLD")
+    entry_threshold_custom_lock: bool = Field(default=False, alias="ENTRY_THRESHOLD_CUSTOM_LOCK")
+    tod_custom_lock: bool = Field(default=False, alias="TOD_CUSTOM_LOCK")
+    qty_precision: int = Field(default=8, alias="QTY_PRECISION")
+    quiet_notifier: bool = Field(default=True, alias="QUIET_NOTIFIER")
+    # Max hold before hard time-stop exit (minutes). Sweet-spot default 30.
+    max_hold_minutes: int = Field(default=30, alias="MAX_HOLD_MINUTES")
+    # Default OFF: reject new BUY when already long that symbol
+    allow_pyramiding: bool = Field(default=False, alias="ALLOW_PYRAMIDING")
+    # Paper-only short entries; never enables live shorting.
+    allow_paper_shorts: bool = Field(default=False, alias="ALLOW_PAPER_SHORTS")
+    paper_book_path: str = Field(
+        default=str(PROJECT_ROOT / "data" / "paper_book.json"),
+        alias="PAPER_BOOK_PATH",
+    )
+    # Cooldown after rejected SELL to avoid log/Telegram spam (seconds)
+    sell_reject_cooldown_seconds: float = Field(
+        default=60.0, alias="SELL_REJECT_COOLDOWN_SECONDS"
+    )
+
+    # Risk (scalp-friendlier position / ATR; keep 1.5%/2% risk + 3% DD)
+    max_risk_per_trade_pct: float = Field(default=0.015, alias="MAX_RISK_PER_TRADE_PCT")
+    max_risk_per_trade_pct_ceiling: float = Field(default=0.02, alias="MAX_RISK_PER_TRADE_PCT_CEILING")
+    daily_drawdown_limit_pct: float = Field(default=0.03, alias="DAILY_DRAWDOWN_LIMIT_PCT")
+    max_position_pct: float = Field(default=0.25, alias="MAX_POSITION_PCT")
+    trailing_stop_atr_mult: float = Field(default=1.5, alias="TRAILING_STOP_ATR_MULT")
+    take_profit_atr_mult: float = Field(default=1.5, alias="TAKE_PROFIT_ATR_MULT")
+    stop_loss_atr_mult: float = Field(default=1.0, alias="STOP_LOSS_ATR_MULT")
+
+    # Alpaca
+    alpaca_api_key: str = Field(default="", alias="ALPACA_API_KEY")
+    alpaca_secret_key: str = Field(default="", alias="ALPACA_SECRET_KEY")
+    alpaca_base_url: str = Field(
+        default="https://paper-api.alpaca.markets",
+        alias="ALPACA_BASE_URL",
+    )
+    alpaca_data_url: str = Field(
+        default="https://data.alpaca.markets",
+        alias="ALPACA_DATA_URL",
+    )
+    alpaca_ws_url: str = Field(
+        default="wss://stream.data.alpaca.markets/v2/iex",
+        alias="ALPACA_WS_URL",
+    )
+
+    # Coinbase Advanced Trade (CDP API key name + private key PEM)
+    coinbase_api_key: str = Field(default="", alias="COINBASE_API_KEY")
+    coinbase_api_secret: str = Field(default="", alias="COINBASE_API_SECRET")
+    # Optional override; production Advanced Trade host is api.coinbase.com
+    coinbase_base_url: str = Field(
+        default="https://api.coinbase.com",
+        alias="COINBASE_BASE_URL",
+    )
+
+    # Kraken spot (Instance #2). Secret is the base64 API-Sign key from Kraken.
+    kraken_api_key: str = Field(default="", alias="KRAKEN_API_KEY")
+    kraken_api_secret: str = Field(default="", alias="KRAKEN_API_SECRET")
+    kraken_base_url: str = Field(
+        default="https://api.kraken.com",
+        alias="KRAKEN_BASE_URL",
+    )
+    kraken_ws_url: str = Field(
+        default="wss://ws.kraken.com/v2",
+        alias="KRAKEN_WS_URL",
+    )
+
+    # Broker selection: alpaca | coinbase | kraken | mock | ib
+    broker: str = Field(default="coinbase", alias="BROKER")
+
+    # Feed / agent loop — 1m bars, faster poll for scalps
+    bar_timeframe: str = Field(default="1Min", alias="BAR_TIMEFRAME")
+    lookback_bars: int = Field(default=100, alias="LOOKBACK_BARS")
+    agent_poll_seconds: float = Field(default=3.0, alias="AGENT_POLL_SECONDS")
+    stale_data_seconds: float = Field(default=120.0, alias="STALE_DATA_SECONDS")
+    slippage_bps: float = Field(default=5.0, alias="SLIPPAGE_BPS")
+    taker_fee_rate: float = Field(default=0.008, alias="TAKER_FEE_RATE")
+    maker_fee_rate: float = Field(default=0.004, alias="MAKER_FEE_RATE")
+    # Fee-clearance cushion (legacy VWAP+ATR mode only). Sweet-spot uses MIN_TP_PCT.
+    fee_clear_mult: float = Field(default=2.0, alias="FEE_CLEAR_MULT")
+
+    # --- Volume Sweet Spot strategy (Option B — replaces VWAP+ATR scalp exits) ---
+    # STRATEGY_MODE=volume_sweet_spot | vwap_scalp (legacy)
+    strategy_mode: str = Field(default="volume_sweet_spot", alias="STRATEGY_MODE")
+    rvol_breakout_mult: float = Field(default=2.0, alias="RVOL_BREAKOUT_MULT")
+    pullback_vol_frac: float = Field(default=0.5, alias="PULLBACK_VOL_FRAC")
+    min_tp_pct: float = Field(default=0.02, alias="MIN_TP_PCT")
+    min_clear_to_resistance_pct: float = Field(
+        default=0.02, alias="MIN_CLEAR_TO_RESISTANCE_PCT"
+    )
+    swing_sl_buffer_pct: float = Field(default=0.002, alias="SWING_SL_BUFFER_PCT")
+    post_only: bool = Field(default=True, alias="POST_ONLY")
+    # Structural guardrails
+    # Block duplicate BUY attempts on same symbol within this window (seconds)
+    buy_dedupe_seconds: float = Field(default=300.0, alias="BUY_DEDUPE_SECONDS")
+    # Max bid-ask spread as fraction of mid (0.001 = 0.1%)
+    max_spread_pct: float = Field(default=0.0025, alias="MAX_SPREAD_PCT")
+    # Min TP distance >= max(MIN_TP_PCT, FEE_TO_TARGET_MULT * 2 * MAKER_FEE_RATE)
+    fee_to_target_mult: float = Field(default=3.0, alias="FEE_TO_TARGET_MULT")
+    tp1_rr: float = Field(default=1.0, alias="TP1_RR")
+    tp2_rr: float = Field(default=2.5, alias="TP2_RR")
+    tp1_fraction: float = Field(default=0.0, alias="TP1_FRACTION")  # 0 = full exits only
+    partial_tp_max_notional_usd: float = Field(default=1000.0, alias="PARTIAL_TP_MAX_NOTIONAL_USD")
+    rvol_exhaustion_mult: float = Field(default=3.0, alias="RVOL_EXHAUSTION_MULT")
+    volume_sma_period: int = Field(default=20, alias="VOLUME_SMA_PERIOD")
+    # BUY entry quality
+    min_confidence: float = Field(default=62.0, alias="MIN_CONFIDENCE")
+    rsi_buy_cap: float = Field(default=72.0, alias="RSI_BUY_CAP")
+    # After stop/trail exit, block new BUY on that symbol (minutes)
+    post_stop_cooldown_min: int = Field(default=15, alias="POST_STOP_COOLDOWN_MIN")
+    # Cap concurrent open positions on the $200 book
+    max_concurrent_positions: int = Field(default=2, alias="MAX_CONCURRENT_POSITIONS")
+    # Trading aggressiveness profile (Telegram /aggressive|/medium|/low|/profile)
+    trade_profile: str = Field(default="medium", alias="TRADE_PROFILE")
+    # Time-of-day UTC rollover gate (23:00–00:30).
+    # DISABLE_TOD_GATE is the profile-facing canonical switch; the legacy
+    # TOD_GATE_ENABLED key remains accepted for backwards compatibility.
+    tod_gate_enabled: bool = Field(default=True, alias="TOD_GATE_ENABLED")
+    disable_tod_gate: bool = Field(default=False, alias="DISABLE_TOD_GATE")
+
+    # Hybrid LLM pre-filter (do NOT call LLM every tick)
+    use_llm: bool = Field(default=False, alias="USE_LLM")
+    prefilter_vwap_boundary_pct: float = Field(default=0.002, alias="PREFILTER_VWAP_BOUNDARY_PCT")
+    prefilter_volume_spike_mult: float = Field(default=2.75, alias="PREFILTER_VOLUME_SPIKE_MULT")
+
+    # Multi-timeframe
+    htf_timeframe: str = Field(default="1Hour", alias="HTF_TIMEFRAME")
+    htf_lookback_bars: int = Field(default=250, alias="HTF_LOOKBACK_BARS")
+    entry_timeframe_5m: str = Field(default="5Min", alias="ENTRY_TIMEFRAME_5M")
+
+    # --- Intelligence upgrades (L2 / regime / MTF / ATR sizing) ---
+    # 1) L2 order book depth imbalance filter (bid/ask vol within band of mid)
+    l2_imbalance_enabled: bool = Field(default=True, alias="L2_IMBALANCE_ENABLED")
+    l2_imbalance_band_pct: float = Field(default=0.005, alias="L2_IMBALANCE_BAND_PCT")
+    l2_imbalance_min_ratio: float = Field(default=1.2, alias="L2_IMBALANCE_MIN_RATIO")
+    # 2) Market regime: ADX + Choppiness on entry timeframe
+    regime_filter_enabled: bool = Field(default=True, alias="REGIME_FILTER_ENABLED")
+    # Phase 2: nightly ATR+ADX macro regime gate (TRENDING/RANGING/HIGH_VOLATILITY)
+    # When HIGH_VOLATILITY: block 5m retest BUYs and scale MAX_NOTIONAL cap ×0.5
+    regime_gate_enabled: bool = Field(default=True, alias="REGIME_GATE_ENABLED")
+    adx_period: int = Field(default=14, alias="ADX_PERIOD")
+    adx_min: float = Field(default=25.0, alias="ADX_MIN")
+    chop_period: int = Field(default=14, alias="CHOP_PERIOD")
+    chop_max: float = Field(default=60.0, alias="CHOP_MAX")  # Al: CI > 60 blocks BUY
+    # 3) Multi-timeframe trend alignment (price > 1h EMA200 AND 4h EMA200)
+    mtf_align_enabled: bool = Field(default=True, alias="MTF_ALIGN_ENABLED")
+    htf_ema_period: int = Field(default=200, alias="HTF_EMA_PERIOD")
+    htf_4h_timeframe: str = Field(default="4Hour", alias="HTF_4H_TIMEFRAME")
+    htf_cache_seconds: float = Field(default=300.0, alias="HTF_CACHE_SECONDS")
+    # 4) Dynamic ATR position sizing
+    # Formula: notional = base_notional * (price * ATR_REF_PCT / ATR)
+    # clipped to [MIN_NOTIONAL_USD, MAX_NOTIONAL_PER_TRADE_USD] — hard caps unchanged
+    atr_sizing_enabled: bool = Field(default=True, alias="ATR_SIZING_ENABLED")
+    atr_sizing_period: int = Field(default=14, alias="ATR_SIZING_PERIOD")
+    atr_ref_pct: float = Field(default=0.01, alias="ATR_REF_PCT")
+    # Volatility-adaptive hard brackets on new paper entries (SL/TP from ATR14 1m)
+    atr_bracket_exits: bool = Field(default=True, alias="ATR_BRACKET_EXITS")
+    # SL distance = max(entry * SL_MIN_PCT, ATR_BRACKET_SL_MULT * ATR14)
+    atr_bracket_sl_mult: float = Field(default=1.5, alias="ATR_BRACKET_SL_MULT")
+    atr_bracket_tp_mult: float = Field(default=2.5, alias="ATR_BRACKET_TP_MULT")
+    atr_bracket_sl_min_pct: float = Field(default=0.01, alias="SL_MIN_PCT")
+    atr_bracket_sl_max_pct: float = Field(default=0.012, alias="SL_MAX_PCT")
+    stop_loss_profile: str = Field(default="medium", alias="STOP_LOSS_PROFILE")
+    winning_formula: bool = Field(default=False, alias="WINNING_FORMULA")
+    # Manual CB master switch: off = still count losses, no auto-pause/cooldown
+    circuit_breaker_enabled: bool = Field(default=True, alias="CIRCUIT_BREAKER_ENABLED")
+    atr_bracket_tp_min_pct: float = Field(default=0.02, alias="TP_MIN_PCT")
+    tp_net_buffer_pct: float = Field(default=0.01, alias="TP_NET_BUFFER_PCT")
+    # Soft ADX regime: raise ENTRY_THRESHOLD when ADX below floor
+    adx_threshold_floor: float = Field(default=20.0, alias="ADX_THRESHOLD_FLOOR")
+    adx_threshold_raise: float = Field(default=15.0, alias="ADX_THRESHOLD_RAISE")
+    # L2 proximity soft boost (hard L2 gate remains separate)
+    l2_proximity_boost_ratio: float = Field(default=1.5, alias="L2_PROXIMITY_BOOST_RATIO")
+    l2_proximity_boost_pts: float = Field(default=10.0, alias="L2_PROXIMITY_BOOST_PTS")
+    # Main symbol loop concurrency + rolling 1m bar buffer
+    scan_concurrency: int = Field(default=6, alias="SCAN_CONCURRENCY")
+    bar_buffer_maxlen: int = Field(default=200, alias="BAR_BUFFER_MAXLEN")
+    # HTF 1h close < EMA200 suppresses LONG / auto-buy
+    htf_ema200_long_filter: bool = Field(default=True, alias="HTF_EMA200_LONG_FILTER")
+
+    # --- Elite Day-Trader Architecture ---
+    # Prefer ATR(1.5/2.5) + fee-lock trail over AGGRESSIVE quick-scalp for new entries
+    elite_risk_enabled: bool = Field(default=True, alias="ELITE_RISK_ENABLED")
+    elite_rvol_min: float = Field(default=1.8, alias="ELITE_RVOL_MIN")
+    elite_max_spread_pct: float = Field(default=0.0025, alias="ELITE_MAX_SPREAD_PCT")
+    elite_atr_sl_mult: float = Field(default=1.5, alias="ELITE_ATR_SL_MULT")
+    elite_atr_tp_mult: float = Field(default=2.5, alias="ELITE_ATR_TP_MULT")
+    elite_fee_lock_arm_pct: float = Field(default=0.0125, alias="ELITE_FEE_LOCK_ARM_PCT")
+    trail_fee_buffer_pct: float = Field(default=0.0125, alias="TRAIL_FEE_BUFFER_PCT")
+    # Disable hard time-stop / stagnant exits while unrealized PnL is negative
+    elite_disable_neg_time_exit: bool = Field(default=True, alias="ELITE_DISABLE_NEG_TIME_EXIT")
+    # BTC market regime (15m EMA20/50 → BEAR_CHOP); blocks alt LONGs
+    btc_regime_enabled: bool = Field(default=True, alias="BTC_REGIME_ENABLED")
+    btc_regime_cache_seconds: float = Field(default=60.0, alias="BTC_REGIME_CACHE_SECONDS")
+    btc_dump_pct: float = Field(default=0.012, alias="BTC_DUMP_PCT")
+    # Pair blacklist via data/trades.db (3 losses/24h → 12h skip)
+    pair_blacklist_enabled: bool = Field(default=True, alias="PAIR_BLACKLIST_ENABLED")
+    trades_db_path: str = Field(
+        default=str(PROJECT_ROOT / "data" / "trades.db"),
+        alias="TRADES_DB_PATH",
+    )
+
+    # --- Lead-lag / funding / optimizer / failure blacklist (PAPER intel v2) ---
+    perp_leadlag_enabled: bool = Field(default=True, alias="PERP_LEADLAG_ENABLED")
+    perp_sweep_mult: float = Field(default=3.0, alias="PERP_SWEEP_MULT")
+    perp_sweep_window_sec: float = Field(default=5.0, alias="PERP_SWEEP_WINDOW_SEC")
+    perp_leadlag_venues: str = Field(default="binance,bybit", alias="PERP_LEADLAG_VENUES")
+    perp_liq_window_sec: float = Field(default=10.0, alias="PERP_LIQ_WINDOW_SEC")
+    perp_liq_min_cluster: int = Field(default=5, alias="PERP_LIQ_MIN_CLUSTER")
+    perp_signal_ttl_sec: float = Field(default=30.0, alias="PERP_SIGNAL_TTL_SEC")
+
+    # --- Phase 1: CVD divergence + short-liquidation sweep (long-only BUY gates) ---
+    # Enable on Instance #2 by copying these keys; paper warmup: PHASE1_ALLOW_COLD_FEED=true
+    cvd_gate_enabled: bool = Field(default=True, alias="CVD_GATE_ENABLED")
+    cvd_period_sec: float = Field(default=300.0, alias="CVD_PERIOD_SEC")
+    liq_sweep_gate_enabled: bool = Field(default=True, alias="LIQ_SWEEP_GATE_ENABLED")
+    liq_sweep_window_sec: float = Field(default=60.0, alias="LIQ_SWEEP_WINDOW_SEC")
+    liq_sweep_notional_usd: float = Field(default=50_000.0, alias="LIQ_SWEEP_NOTIONAL_USD")
+    liq_sweep_ttl_sec: float = Field(default=30.0, alias="LIQ_SWEEP_TTL_SEC")
+    # fail-closed when tape/period data is missing (default). Confirmed absorption /
+    # missing short-liq spike always block once the feed is warm.
+    phase1_fail_closed: bool = Field(default=True, alias="PHASE1_FAIL_CLOSED")
+    # Paper warmup bypass: allow BUY while CVD/liq WS counters are still cold.
+    phase1_allow_cold_feed: bool = Field(default=False, alias="PHASE1_ALLOW_COLD_FEED")
+
+    funding_oi_enabled: bool = Field(default=True, alias="FUNDING_OI_ENABLED")
+    funding_oi_poll_seconds: float = Field(default=60.0, alias="FUNDING_OI_POLL_SECONDS")
+    funding_block_threshold: float = Field(default=0.0003, alias="FUNDING_BLOCK_THRESHOLD")
+    funding_boost_threshold: float = Field(default=-0.0001, alias="FUNDING_BOOST_THRESHOLD")
+    funding_oi_surge_pct: float = Field(default=0.02, alias="FUNDING_OI_SURGE_PCT")
+    funding_stagnant_bars: int = Field(default=3, alias="FUNDING_STAGNANT_BARS")
+
+    optimizer_enabled: bool = Field(default=True, alias="OPTIMIZER_ENABLED")
+    optimizer_lookback_days: int = Field(default=14, alias="OPTIMIZER_LOOKBACK_DAYS")
+    active_params_path: str = Field(
+        default=str(PROJECT_ROOT / "data" / "active_params.json"),
+        alias="ACTIVE_PARAMS_PATH",
+    )
+
+    failure_blacklist_enabled: bool = Field(default=True, alias="FAILURE_BLACKLIST_ENABLED")
+    failure_lookback_hours: float = Field(default=72.0, alias="FAILURE_LOOKBACK_HOURS")
+    failure_block_minutes: float = Field(default=45.0, alias="FAILURE_BLOCK_MINUTES")
+
+    # --- PAPER intel v3: on-chain / reslice / cointegration / sweep-fade ---
+    onchain_guards_enabled: bool = Field(default=True, alias="ONCHAIN_GUARDS_ENABLED")
+    onchain_poll_seconds: float = Field(default=120.0, alias="ONCHAIN_POLL_SECONDS")
+    onchain_cache_ttl_sec: float = Field(default=180.0, alias="ONCHAIN_CACHE_TTL_SEC")
+    onchain_inflow_spike_mult: float = Field(default=2.5, alias="ONCHAIN_INFLOW_SPIKE_MULT")
+    stablecoin_mint_boost: float = Field(default=3.0, alias="STABLECOIN_MINT_BOOST")
+    onchain_flow_url: str = Field(default="", alias="ONCHAIN_FLOW_URL")
+    onchain_stable_url: str = Field(default="", alias="ONCHAIN_STABLE_URL")
+    onchain_api_key: str = Field(default="", alias="ONCHAIN_API_KEY")
+    onchain_mock_mode: bool = Field(default=False, alias="ONCHAIN_MOCK_MODE")
+
+    order_reslice_enabled: bool = Field(default=True, alias="ORDER_RESLICE_ENABLED")
+    order_reslice_stall_sec: float = Field(default=10.0, alias="ORDER_RESLICE_STALL_SEC")
+    order_reslice_max_times: int = Field(default=3, alias="ORDER_RESLICE_MAX_TIMES")
+
+    cointegration_enabled: bool = Field(default=True, alias="COINTEGRATION_ENABLED")
+    coint_z_entry: float = Field(default=2.0, alias="COINT_Z_ENTRY")
+    coint_pairs: str = Field(
+        default="SOL-USD/AVAX-USD,ETH-USD/LINK-USD,BTC-USD/ETH-USD",
+        alias="COINT_PAIRS",
+    )
+    coint_window: int = Field(default=96, alias="COINT_WINDOW")
+    coint_min_corr: float = Field(default=0.5, alias="COINT_MIN_CORR")
+
+    sweep_fade_enabled: bool = Field(default=True, alias="SWEEP_FADE_ENABLED")
+    sweep_fade_lookback: int = Field(default=50, alias="SWEEP_FADE_LOOKBACK")
+    sweep_fade_absorption_ratio: float = Field(
+        default=1.5, alias="SWEEP_FADE_ABSORPTION_RATIO"
+    )
+
+    # Macro event pause
+    macro_pause_enabled: bool = Field(default=True, alias="MACRO_PAUSE_ENABLED")
+    macro_pause_minutes: int = Field(default=15, alias="MACRO_PAUSE_MINUTES")
+    macro_calendar_url: str = Field(default="", alias="MACRO_CALENDAR_URL")
+    macro_calendar_api_key: str = Field(default="", alias="MACRO_CALENDAR_API_KEY")
+
+    # Anti-revenge lockout + trade memory
+    revenge_lockout_minutes: int = Field(default=30, alias="REVENGE_LOCKOUT_MINUTES")
+    revenge_stop_count: int = Field(default=2, alias="REVENGE_STOP_COUNT")
+    trade_memory_size: int = Field(default=5, alias="TRADE_MEMORY_SIZE")
+
+    # Notifier (Discord / Telegram) — empty = no-op
+    discord_webhook_url: str = Field(default="", alias="DISCORD_WEBHOOK_URL")
+    telegram_bot_token: str = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
+    telegram_commands_enabled: bool = Field(
+        default=True, alias="TELEGRAM_COMMANDS_ENABLED"
+    )
+    # Once-daily Telegram PnL digest (engine asyncio task — not JobQueue)
+    # Change SUMMARY_HOUR / SUMMARY_MINUTE in .env and restart to reschedule.
+    summary_hour: int = Field(default=7, alias="SUMMARY_HOUR")
+    summary_minute: int = Field(default=0, alias="SUMMARY_MINUTE")
+    summary_timezone: str = Field(default="America/Chicago", alias="SUMMARY_TIMEZONE")
+    daily_digest_enabled: bool = Field(default=True, alias="DAILY_DIGEST_ENABLED")
+    # Tick/L2 heartbeat: reconnect if market-data fetch age exceeds this (seconds)
+    stale_tick_seconds: float = Field(default=15.0, alias="STALE_TICK_SECONDS")
+
+    # Kill switch
+    liquidate_on_kill: bool = Field(default=False, alias="LIQUIDATE_ON_KILL")
+
+    # Persistence
+    sqlite_path: str = Field(
+        default=str(PROJECT_ROOT / "data" / "trading_bot.db"),
+        alias="SQLITE_PATH",
+    )
+    postgres_dsn: str = Field(default="", alias="POSTGRES_DSN")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    # Stabilization: memory/stream maintenance + SQLite backups
+    maintenance_interval_hours: float = Field(
+        default=6.0, alias="MAINTENANCE_INTERVAL_HOURS"
+    )
+    sqlite_backup_keep: int = Field(default=7, alias="SQLITE_BACKUP_KEEP")
+    sqlite_backup_dir: str = Field(
+        default=str(PROJECT_ROOT / "data" / "backups"),
+        alias="SQLITE_BACKUP_DIR",
+    )
+
+    @model_validator(mode="after")
+    def sync_disable_tod_gate(self):
+        """Make DISABLE_TOD_GATE authoritative over the legacy enable flag."""
+        if self.disable_tod_gate:
+            object.__setattr__(self, "tod_gate_enabled", False)
+        return self
+
+    @field_validator("max_risk_per_trade_pct")
+    @classmethod
+    def clamp_risk(cls, v: float) -> float:
+        if v < 0.01:
+            return 0.01
+        if v > 0.02:
+            return 0.02
+        return v
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        return normalize_active_symbol(symbol)
+
+    def normalized_symbol_mode(self) -> str:
+        m = str(getattr(self, "symbol_mode", "ALLOWLIST") or "ALLOWLIST").strip().upper()
+        m = m.replace("-", "_")
+        if m in ("OFF", "NONE", "CRYPTO_OFF", "STOCKS_ONLY"):
+            return "OFF"
+        if m in ("DYNAMIC", "DYNAMIC_ALL", "ALL"):
+            return "DYNAMIC_ALL"
+        return "ALLOWLIST"
+
+    def is_allowlisted(self, symbol: str) -> bool:
+        sym = self.normalize_symbol(symbol)
+        if _runtime_active_symbols is not None:
+            return sym in _runtime_active_symbols
+        if self.normalized_symbol_mode() == "OFF":
+            return False
+        if self.normalized_symbol_mode() == "DYNAMIC_ALL":
+            # Until first dynamic refresh, seed with canonical allowlist
+            return sym in HARD_SYMBOL_ALLOWLIST
+        return sym in HARD_SYMBOL_ALLOWLIST
+
+    @property
+    def symbol_list(self) -> List[str]:
+        """Active trading symbols — ALLOWLIST intersect or DYNAMIC_ALL runtime list."""
+        if _runtime_active_symbols is not None:
+            return list(_runtime_active_symbols)
+        if self.normalized_symbol_mode() == "OFF":
+            return []
+
+        requested = [self.normalize_symbol(s) for s in self.symbols.split(",") if s.strip()]
+        allowed = [s for s in requested if s in HARD_SYMBOL_ALLOWLIST]
+        rejected = [s for s in requested if s not in HARD_SYMBOL_ALLOWLIST]
+        if rejected:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "Rejecting non-allowlist symbols (ignored): %s", ",".join(rejected)
+            )
+        if not allowed:
+            return list(DEFAULT_SYMBOL_ALLOWLIST)
+        out: List[str] = []
+        for s in allowed:
+            if s not in out:
+                out.append(s)
+        return out
+
+    @property
+    def required_min_tp_pct(self) -> float:
+        """Stricter of MIN_TP_PCT, 3× RT fee, and RT+net buffer."""
+        from trading_bot.structural_guardrails import required_min_tp_pct as _req
+
+        taker = float(getattr(self, "taker_fee_rate", 0.005) or 0.005)
+        rt = max(0.005, 2.0 * min(taker, 0.01))
+        return _req(
+            float(self.min_tp_pct),
+            float(self.maker_fee_rate),
+            float(self.fee_to_target_mult),
+            net_buffer_pct=float(getattr(self, "tp_net_buffer_pct", 0.01) or 0.01),
+            rt_fee_pct=rt,
+        )
+
+
+    @property
+    def is_sweet_spot(self) -> bool:
+        return (self.strategy_mode or "").strip().lower() in (
+            "volume_sweet_spot",
+            "sweet_spot",
+            "vss",
+        )
+
+    @property
+    def effective_broker(self) -> str:
+        if self.dry_run:
+            return "mock"
+        return (self.broker or "coinbase").lower()
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+def reload_settings() -> Settings:
+    get_settings.cache_clear()
+    return get_settings()
+
+
+ENV_KEY_TRADE_CAP = "MAX_NOTIONAL_PER_TRADE_USD"
+ENV_KEY_MAX_BOOK = "MAX_TOTAL_EXPOSURE_USD"
+ENV_KEY_ENTRY_THRESHOLD = "ENTRY_THRESHOLD"
+ENV_KEY_STOP_LOSS_PROFILE = "STOP_LOSS_PROFILE"
+ENV_KEY_WINNING_FORMULA = "WINNING_FORMULA"
+ENV_KEY_CIRCUIT_BREAKER_ENABLED = "CIRCUIT_BREAKER_ENABLED"
+ENV_KEY_SL_MIN_PCT = "SL_MIN_PCT"
+ENV_KEY_SL_MAX_PCT = "SL_MAX_PCT"
+ENV_KEY_ELITE_ATR_SL_MULT = "ELITE_ATR_SL_MULT"
+ENV_KEY_ENTRY_THRESHOLD_CUSTOM_LOCK = "ENTRY_THRESHOLD_CUSTOM_LOCK"
+ENV_KEY_MAX_SPREAD_PCT = "MAX_SPREAD_PCT"
+ENV_KEY_TRADE_PROFILE = "TRADE_PROFILE"
+ENV_KEY_TOD_GATE_ENABLED = "TOD_GATE_ENABLED"  # legacy compatibility
+ENV_KEY_DISABLE_TOD_GATE = "DISABLE_TOD_GATE"
+ENV_KEY_TOD_CUSTOM_LOCK = "TOD_CUSTOM_LOCK"
+ENV_KEY_RVOL_BREAKOUT_MULT = "RVOL_BREAKOUT_MULT"
+ENV_KEY_MAX_CONCURRENT_POSITIONS = "MAX_CONCURRENT_POSITIONS"
+ENV_KEY_PREFILTER_VOLUME_SPIKE_MULT = "PREFILTER_VOLUME_SPIKE_MULT"
+ENV_KEY_AGENT_POLL_SECONDS = "AGENT_POLL_SECONDS"
+ENV_KEY_BAR_TIMEFRAME = "BAR_TIMEFRAME"
+ENV_KEY_PHASE1_FAIL_CLOSED = "PHASE1_FAIL_CLOSED"
+ENV_KEY_POST_ONLY = "POST_ONLY"
+ENV_KEY_SYMBOL_MODE = "SYMBOL_MODE"
+ENV_KEY_UNIVERSE_STOCKS = "UNIVERSE_STOCKS"
+
+_ENV_LINE_RE = re.compile(
+    r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$"
+)
+
+
+def format_env_float(value: float) -> str:
+    """Compact decimal for .env (no scientific notation; strip trailing zeros)."""
+    s = f"{float(value):.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def apply_runtime_trade_caps(settings: Settings, trade_cap: float, max_book: float) -> None:
+    """Mutate the live Settings instance shared with risk_manager / executor.
+
+    Does not change paper/live mode. Callers persist env keys separately.
+    """
+    object.__setattr__(settings, "max_notional_per_trade_usd", float(trade_cap))
+    object.__setattr__(settings, "max_total_exposure_usd", float(max_book))
+
+
+def apply_runtime_entry_threshold(settings: Settings, threshold: float | int) -> float:
+    """Mutate Settings.entry_threshold and the module-level proximity runtime value."""
+    from trading_bot.utils.entry_proximity import set_entry_threshold
+
+    val = float(threshold)
+    object.__setattr__(settings, "entry_threshold", val)
+    set_entry_threshold(val)
+    return val
+
+
+def apply_runtime_max_spread_pct(settings: Settings, max_spread_pct: float) -> float:
+    """Mutate Settings.max_spread_pct (fraction of mid). Used by structural spread gate."""
+    val = float(max_spread_pct)
+    object.__setattr__(settings, "max_spread_pct", val)
+    return val
+
+
+def apply_runtime_trade_profile(
+    settings: Settings,
+    profile: str,
+    knobs: Mapping[str, object],
+    *,
+    signal_engine: object | None = None,
+) -> str:
+    """Apply a named aggressiveness profile to Settings (+ optional signal engine).
+
+    ``knobs`` keys use Settings field names (snake_case). Always keeps
+    phase1_fail_closed / post_only True when present in knobs.
+    Returns normalized profile name.
+    """
+    name = str(profile).strip().lower()
+    object.__setattr__(settings, "trade_profile", name)
+
+    if "entry_threshold" in knobs:
+        apply_runtime_entry_threshold(settings, knobs["entry_threshold"])
+    if "max_spread_pct" in knobs:
+        apply_runtime_max_spread_pct(settings, float(knobs["max_spread_pct"]))
+    if "rvol_breakout_mult" in knobs:
+        rvol = float(knobs["rvol_breakout_mult"])
+        object.__setattr__(settings, "rvol_breakout_mult", rvol)
+        if signal_engine is not None and hasattr(signal_engine, "rvol_breakout_mult"):
+            signal_engine.rvol_breakout_mult = rvol
+    if "prefilter_volume_spike_mult" in knobs:
+        object.__setattr__(
+            settings,
+            "prefilter_volume_spike_mult",
+            float(knobs["prefilter_volume_spike_mult"]),
+        )
+    if "disable_tod_gate" in knobs:
+        disable_tod = bool(knobs["disable_tod_gate"])
+        object.__setattr__(settings, "disable_tod_gate", disable_tod)
+        tod = not disable_tod
+        object.__setattr__(settings, "tod_gate_enabled", tod)
+        if signal_engine is not None:
+            if hasattr(signal_engine, "disable_tod_gate"):
+                signal_engine.disable_tod_gate = disable_tod
+            if hasattr(signal_engine, "tod_gate_enabled"):
+                signal_engine.tod_gate_enabled = tod
+    elif "tod_gate_enabled" in knobs:
+        tod = bool(knobs["tod_gate_enabled"])
+        object.__setattr__(settings, "tod_gate_enabled", tod)
+        object.__setattr__(settings, "disable_tod_gate", not tod)
+        if signal_engine is not None and hasattr(signal_engine, "tod_gate_enabled"):
+            signal_engine.tod_gate_enabled = tod
+    if "max_concurrent_positions" in knobs:
+        object.__setattr__(
+            settings,
+            "max_concurrent_positions",
+            int(knobs["max_concurrent_positions"]),
+        )
+    if "agent_poll_seconds" in knobs:
+        object.__setattr__(
+            settings,
+            "agent_poll_seconds",
+            float(knobs["agent_poll_seconds"]),
+        )
+    if "bar_timeframe" in knobs:
+        object.__setattr__(settings, "bar_timeframe", str(knobs["bar_timeframe"]))
+    if "max_notional_per_trade_usd" in knobs or "max_total_exposure_usd" in knobs:
+        trade_cap = float(
+            knobs.get(
+                "max_notional_per_trade_usd",
+                getattr(settings, "max_notional_per_trade_usd", 1000.0),
+            )
+        )
+        max_book = float(
+            knobs.get(
+                "max_total_exposure_usd",
+                getattr(settings, "max_total_exposure_usd", 1500.0),
+            )
+        )
+        apply_runtime_trade_caps(settings, trade_cap, max_book)
+    # Sync prefilter volume mult onto AgentCore.prefilter when present
+    if "prefilter_volume_spike_mult" in knobs and signal_engine is not None:
+        # signal_engine may be VolumeSweetSpot; AgentCore is passed separately by callers
+        pass
+    # Safety: never disable maker-only / Phase1 fail-closed via profile
+    object.__setattr__(settings, "post_only", True)
+    if hasattr(settings, "phase1_fail_closed"):
+        object.__setattr__(settings, "phase1_fail_closed", True)
+    return name
+
+
+
+
+def upsert_env_keys(path: Path | str, updates: Mapping[str, str]) -> Path:
+
+    """Create or update KEY=value lines in a .env file without wiping other keys.
+
+    Comment lines are left untouched. Existing matching keys are replaced in
+    place (including ``export KEY=``). Missing keys are appended. Write is
+    atomic (temp file + replace) so a crash cannot truncate the file.
+    """
+    env_path = Path(path)
+    pending = {str(k): str(v) for k, v in updates.items()}
+    if not pending:
+        return env_path
+
+    if env_path.exists():
+        raw = env_path.read_text(encoding="utf-8")
+        existing_lines = raw.splitlines()
+    else:
+        existing_lines = []
+
+    found: set[str] = set()
+    out: list[str] = []
+    for line in existing_lines:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        match = _ENV_LINE_RE.match(line)
+        if match is None:
+            out.append(line)
+            continue
+        key = match.group(2)
+        if key in pending:
+            out.append(f"{match.group(1)}{key}{match.group(3)}{pending[key]}")
+            found.add(key)
+        else:
+            out.append(line)
+
+    for key, value in pending.items():
+        if key not in found:
+            out.append(f"{key}={value}")
+
+    text = "\n".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=env_path.name + ".",
+        suffix=".tmp",
+        dir=str(env_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, env_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return env_path

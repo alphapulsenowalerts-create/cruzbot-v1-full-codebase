@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+!.env.instance2.example
 .venv/
 venv/
 __pycache__/
@@ -6,7 +9,15 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 data/*.db
+*.db
 *.egg-info/
 dist/
 build/
 .DS_Store
+instances/**/.env
+instances/**/.env.*
+!instances/**/.env.example
+!instances/**/.env.instance2.example
+instances/**/data/*.db
+instances/**/data/*.json
+!instances/**/data/.gitkeep
